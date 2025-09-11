@@ -16,9 +16,10 @@ grid_aggregate_size = 1
 sig_level = 0.05
 lift_cap_percentile = 95
 lift_max_val = 10
-output_dir = "G:/ar_analysis/output_2"
+output_dir = "G:/ar_analysis/output_probability"
 os.makedirs(output_dir, exist_ok=True)
 control_modes = ["ENSO", "MJO", "AO", "PDO"]
+mode_lags = {"ENSO": 0, "MJO": 0, "AO": 0, "PDO": 0}
 
 
 def load_enso():
@@ -82,16 +83,36 @@ def load_pdo():
     return bucket
 
 
+def shift_series_monthly(series, lag_months):
+    """对时间序列做月滞后，正数表示向后平移"""
+    if lag_months == 0:
+        return series
+    # 将 index 转换为月初时间戳，避免日对齐问题
+    idx = pd.to_datetime(series.index).to_period("M").to_timestamp()
+    series.index = idx
+    shifted = series.copy()
+    shifted.index = shifted.index + pd.DateOffset(months=lag_months)
+    return shifted
+
+
 def get_bucket_labels(dates_series):
     labels = {}
     if "ENSO" in control_modes:
-        labels["ENSO"] = load_enso().reindex(dates_series, method='nearest').values
+        enso = load_enso()
+        enso = shift_series_monthly(enso, mode_lags.get("ENSO", 0))
+        labels["ENSO"] = enso.reindex(dates_series, method='nearest').values
     if "MJO" in control_modes:
-        labels["MJO"] = load_mjo().reindex(dates_series, method='nearest').values
+        mjo = load_mjo()
+        mjo = shift_series_monthly(mjo, mode_lags.get("MJO", 0))
+        labels["MJO"] = mjo.reindex(dates_series, method='nearest').values
     if "AO" in control_modes:
-        labels["AO"] = load_ao().reindex(dates_series, method='nearest').values
+        ao = load_ao()
+        ao = shift_series_monthly(ao, mode_lags.get("AO", 0))
+        labels["AO"] = ao.reindex(dates_series, method='nearest').values
     if "PDO" in control_modes:
-        labels["PDO"] = load_pdo().reindex(dates_series, method='nearest').values
+        pdo = load_pdo()
+        pdo = shift_series_monthly(pdo, mode_lags.get("PDO", 0))
+        labels["PDO"] = pdo.reindex(dates_series, method='nearest').values
     return labels
 
 
@@ -278,6 +299,11 @@ if __name__ == "__main__":
     plot_map(max_prob, 'Maximum P(EP|AR) by Controlling Mode', 'max_p_ext_ar', vmin=0, vmax=1, sig_mask=max_p_sig,
              max_mode=max_mode)
     with open(f"{output_dir}/summary_stats.txt", "w") as f:
+        f.write("=== Mode lag settings (months) ===\n")
+        for mode, lag in mode_lags.items():
+            f.write(f"{mode}: lag = {lag} months\n")
+        f.write("\n=== Statistics ===\n")
+
         for mode in results:
             for bucket in results[mode]:
                 p_ext_ar = results[mode][bucket]['p_ext_ar']
