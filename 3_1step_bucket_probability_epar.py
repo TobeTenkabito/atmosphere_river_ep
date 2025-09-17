@@ -1,4 +1,5 @@
 import matplotlib
+
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import netCDF4 as nc
@@ -12,6 +13,7 @@ from scipy.ndimage import uniform_filter
 import os
 import pandas as pd
 from tqdm import tqdm
+
 grid_aggregate_size = 1
 sig_level = 0.05
 lift_cap_percentile = 95
@@ -123,32 +125,56 @@ def compute_bucket_stats(ar_data, precip_data, bucket_labels):
         results[mode] = {}
         for bucket in buckets:
             mask = bucket_labels[mode] == bucket
-            print(f"{mode}={bucket}: {np.sum(mask)} time points")  # Debug print
+            print(f"{mode}={bucket}: {np.sum(mask)} time points")
             if np.sum(mask) == 0:
                 continue
             ar_subset = ar_data[mask]
             precip_subset = precip_data[mask]
-            A = np.sum((ar_subset == 1) & (precip_subset == 1), axis=0)
-            B = np.sum((ar_subset == 1) & (precip_subset == 0), axis=0)
-            C = np.sum((ar_subset == 0) & (precip_subset == 1), axis=0)
-            D = np.sum((ar_subset == 0) & (precip_subset == 0), axis=0)
-            p_ext_ar = np.where((A + B) > 0, A / (A + B), np.nan)  # P(EP|AR)
-            p_ext_no_ar = np.where((C + D) > 0, C / (C + D), np.nan)  # P(EP|no AR)
+            A = np.sum((ar_subset == 1) & (precip_subset == 1), axis=0)  # AR and EP
+            B = np.sum((ar_subset == 1) & (precip_subset == 0), axis=0)  # AR and no EP
+            C = np.sum((ar_subset == 0) & (precip_subset == 1), axis=0)  # no AR and EP
+            D = np.sum((ar_subset == 0) & (precip_subset == 0), axis=0)  # no AR and no EP
+
+            # Prevent division by zero
+            denom_AR = np.where((A + B) > 0, A + B, np.nan)
+            denom_notAR = np.where((C + D) > 0, C + D, np.nan)
+
+            # P(EP|AR) and P(EP|no AR)
+            p_ext_ar = A / denom_AR
+            p_ext_no_ar = C / denom_notAR
+
+            # PAF and AF calculation
+            N = A + B + C + D
+            Freq_E = (A + C) / np.where(N > 0, N, np.nan)
+
+            # AF (Attributable Fraction)
+            AF = (p_ext_ar - p_ext_no_ar) / p_ext_ar
+
+            # PAF (Population Attributable Fraction)
+            p_notAR = (C + D) / np.where(N > 0, N, np.nan)
+            PAF = (Freq_E - p_notAR * p_ext_no_ar) / Freq_E
+
             p_sig = np.full(A.shape, np.nan)
             for i in range(A.shape[0]):
                 for j in range(A.shape[1]):
                     table = [[A[i, j], B[i, j]], [C[i, j], D[i, j]]]
                     if np.sum(table) > 0:
-                        _, p = fisher_exact(table)
+                        _, p = fisher_exact(table, alternative="greater")  # 单侧检验：AR 是否增加 EP
                         p_sig[i, j] = p
+
             if grid_aggregate_size > 1:
                 p_ext_ar = uniform_filter(p_ext_ar, size=grid_aggregate_size, mode='nearest')
                 p_ext_no_ar = uniform_filter(p_ext_no_ar, size=grid_aggregate_size, mode='nearest')
                 p_sig = uniform_filter(p_sig, size=grid_aggregate_size, mode='nearest')
+                AF = uniform_filter(AF, size=grid_aggregate_size, mode='nearest')
+                PAF = uniform_filter(PAF, size=grid_aggregate_size, mode='nearest')
+
             results[mode][bucket] = {
                 'p_ext_ar': p_ext_ar,
                 'p_ext_no_ar': p_ext_no_ar,
-                'p_sig': p_sig
+                'p_sig': p_sig,
+                'AF': AF,
+                'PAF': PAF
             }
     return results
 
@@ -207,6 +233,29 @@ def plot_map(data, title, filename, vmin, vmax, sig_mask=None, max_mode=None):
         plt.colorbar(mesh, ax=ax, label='Probability', shrink=0.8, location='right')
     plt.title(f"{title}\n{start_date_input} to {end_date_input}", fontsize=14)
     plt.savefig(f"{output_dir}/{filename}.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_map_single_colorbar(data_grid, title, outfile, lons, lats, vmin, vmax, sig_mask=None, cmap="coolwarm"):
+    fig = plt.figure(figsize=(12, 6))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+    # 背景要素
+    ax.coastlines(resolution="50m", linewidth=0.8)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+    ax.add_feature(cfeature.LAND, facecolor="lightgray", alpha=0.3)
+
+    if sig_mask is not None:
+        data_grid = np.where(sig_mask < sig_level, data_grid, np.nan)
+
+    mesh = ax.pcolormesh(lons, lats, data_grid, cmap=cmap, shading="auto",
+                         transform=ccrs.PlateCarree(), vmin=vmin, vmax=vmax)
+    cb = plt.colorbar(mesh, ax=ax, orientation="vertical", shrink=0.7, pad=0.05)
+    cb.set_label(title)
+
+    plt.title(title, fontsize=14)
+    plt.savefig(outfile, dpi=300, bbox_inches="tight")
     plt.close()
 
 
@@ -286,18 +335,44 @@ if __name__ == "__main__":
     ar_dates_sel_dt = pd.to_datetime([d.strftime('%Y-%m-%d %H:%M:%S') for d in ar_dates_sel])
     bucket_labels = get_bucket_labels(ar_dates_sel_dt)
     results = compute_bucket_stats(ar_data, precip_data, bucket_labels)
+    all_sig_paf = []
+    all_sig_af = []
+
     for mode in results:
         for bucket in results[mode]:
             p_ext_ar = results[mode][bucket]['p_ext_ar']
             p_ext_no_ar = results[mode][bucket]['p_ext_no_ar']
             p_sig = results[mode][bucket]['p_sig']
+            AF = results[mode][bucket]['AF']
+            PAF = results[mode][bucket]['PAF']
+
             plot_map(p_ext_ar, f'P(EP|AR, {mode}={bucket})', f'p_ext_ar_{mode}_{bucket}', vmin=0, vmax=1,
                      sig_mask=p_sig)
             plot_map(p_ext_no_ar, f'P(EP|no AR, {mode}={bucket})', f'p_ext_no_ar_{mode}_{bucket}', vmin=0, vmax=1,
                      sig_mask=p_sig)
+
+            # 绘制 AF 和 PAF 地图
+            plot_map_single_colorbar(AF, f'AF ({mode}={bucket})', f'AF_map_{mode}_{bucket}.png',
+                                     lons, lats, vmin=0, vmax=1, sig_mask=p_sig, cmap="coolwarm")
+            plot_map_single_colorbar(PAF, f'PAF ({mode}={bucket})', f'PAF_map_{mode}_{bucket}.png',
+                                     lons, lats, vmin=0, vmax=1, sig_mask=p_sig, cmap="coolwarm")
+
+            # 收集显著格点的 AF 和 PAF
+            sig_paf = PAF[p_sig < sig_level]
+            sig_af = AF[p_sig < sig_level]
+            all_sig_paf.extend(sig_paf[~np.isnan(sig_paf)])
+            all_sig_af.extend(sig_af[~np.isnan(sig_af)])
+
     max_prob, max_mode, max_p_sig = find_max_prob(results, ar_lats, ar_lons)
     plot_map(max_prob, 'Maximum P(EP|AR) by Controlling Mode', 'max_p_ext_ar', vmin=0, vmax=1, sig_mask=max_p_sig,
              max_mode=max_mode)
+
+    mean_paf = np.nanmean(all_sig_paf) if all_sig_paf else np.nan
+    mean_af = np.nanmean(all_sig_af) if all_sig_af else np.nan
+
+    print(f"Global mean PAF (p<0.05): {mean_paf:.4f}")
+    print(f"Global mean AF (p<0.05): {mean_af:.4f}")
+
     with open(f"{output_dir}/summary_stats.txt", "w") as f:
         f.write("=== Mode lag settings (months) ===\n")
         for mode, lag in mode_lags.items():
@@ -309,10 +384,19 @@ if __name__ == "__main__":
                 p_ext_ar = results[mode][bucket]['p_ext_ar']
                 p_ext_no_ar = results[mode][bucket]['p_ext_no_ar']
                 p_sig = results[mode][bucket]['p_sig']
+                AF = results[mode][bucket]['AF']
+                PAF = results[mode][bucket]['PAF']
+
                 f.write(f"Mean P(EP|AR, {mode}={bucket}): {np.nanmean(p_ext_ar):.3f}\n")
                 f.write(f"Mean P(EP|no AR, {mode}={bucket}): {np.nanmean(p_ext_no_ar):.3f}\n")
+                f.write(f"Mean AF ({mode}={bucket}, p<0.05): {np.nanmean(AF[p_sig < sig_level]):.3f}\n")
+                f.write(f"Mean PAF ({mode}={bucket}, p<0.05): {np.nanmean(PAF[p_sig < sig_level]):.3f}\n")
                 f.write(f"Significant grid points (p < {sig_level}, {mode}={bucket}): {np.sum(p_sig < sig_level)}\n")
         f.write(f"Effective grid points (Max P): {np.sum(~np.isnan(max_prob))}\n")
+        f.write("\n=== Global Averages (for all significant points) ===\n")
+        f.write(f"Global mean PAF (p<0.05): {mean_paf:.4f}\n")
+        f.write(f"Global mean AF (p<0.05): {mean_af:.4f}\n")
+
     print("绘图与统计完成，输出文件已保存到:", output_dir)
     ar_ds.close()
     precip_ds.close()
