@@ -1,4 +1,4 @@
-name: ARs_detection
+name: atmosphere_river_ep
 channels:
   - conda-forge
   - defaults
@@ -331,4 +331,5 @@ dependencies:
   - zstd=1.5.7=hbeecb71_2
   - pip:
       - netcdf4==1.7.2
-prefix: G:\Anaconda3\envs\ARs_detection
+prefix: G:\Anaconda3\envs\atmosphere_ar_ep
+
