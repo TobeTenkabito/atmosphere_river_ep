@@ -109,6 +109,106 @@ def plot_map(data, title, filename, output_dir, region_name, vmin=None, vmax=Non
     plt.close()
 
 
+def plot_seasonal_subfigures(seasonal_data, output_dir, filename, title, lon_min, lon_max, lat_min, lat_max, lons,
+                             lats):
+    """
+    Plots a 2x2 grid of subfigures for seasonal analysis of a single metric.
+    The main title is placed on the top-left subplot.
+    The legend is placed at the bottom center of the entire figure.
+    """
+    # Find global min and max for all seasons to ensure consistent colorbar
+    all_data = np.concatenate([d.flatten() for d in seasonal_data.values()])
+    vmin = np.nanmin(all_data) if not np.all(np.isnan(all_data)) else 0
+    vmax = np.nanmax(all_data) if not np.all(np.isnan(all_data)) else 1
+
+    # Special handling for PAF to ensure colorbar is symmetric around zero
+    if title == "PAF":
+        abs_max = max(abs(vmin), abs(vmax))
+        vmin = -abs_max
+        vmax = abs_max
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10), subplot_kw={'projection': ccrs.PlateCarree()})
+
+    # Subplot labels
+    subplot_labels = ["(a)", "(b)", "(c)", "(d)"]
+
+    # Iterate through each season and plot to the corresponding subplot
+    seasons_list = list(seasons.keys())
+    for i, season_name in enumerate(seasons_list):
+        row, col = i // 2, i % 2
+        ax = axes[row, col]
+        data = seasonal_data[season_name]
+
+        # Plotting
+        mesh = ax.pcolormesh(lons, lats, data, cmap='coolwarm', vmin=vmin, vmax=vmax,
+                             transform=ccrs.PlateCarree())
+
+        # Add coastlines, borders, and gridlines
+        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+        ax.add_feature(cfeature.LAND, facecolor='#D3D3D3')
+        ax.add_feature(cfeature.OCEAN, facecolor='#E6F0FA')
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+        ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.8)
+
+        # Only show lat/lon labels on the left and bottom subplots
+        draw_labels_left = col == 0
+        draw_labels_bottom = row == 1
+        gl = ax.gridlines(draw_labels=True, linestyle='--', alpha=0.3)
+        gl.top_labels = False
+        gl.right_labels = False
+        if not draw_labels_left:
+            gl.left_labels = False
+        if not draw_labels_bottom:
+            gl.bottom_labels = False
+
+        # Add (a), (b), (c), (d) labels to the top-left corner
+        ax.text(0.02, 0.98, subplot_labels[i], transform=ax.transAxes,
+                fontsize=14, fontweight='bold', va='top', ha='left')
+
+        # Add seasonal identifier to the top-right corner
+        ax.text(0.98, 0.98, season_name, transform=ax.transAxes,
+                fontsize=12, va='top', ha='right')
+
+    # Adjust spacing between subplots
+    plt.tight_layout(rect=[0, 0.1, 1, 0.95])
+
+    # Add a common colorbar at the bottom center of the entire figure
+    cbar_ax = fig.add_axes([0.15, 0.05, 0.7, 0.02])
+    cbar = fig.colorbar(mesh, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label(f'{title} Value', fontsize=12)
+
+    # Save the figure
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(f"{output_dir}/{filename}.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_all_seasonal_subfigures(seasonal_data_dict, output_dir, lon_min, lon_max, lat_min, lat_max, lons, lats):
+    """
+    Orchestrates the plotting of all seasonal subfigures for each metric.
+    """
+    metrics_to_plot = {
+        "p_ext_ar": "P(Extreme | AR)",
+        "p_ext_no_ar": "P(Extreme | No AR)",
+        "paf": "PAF",
+        "af": "AF",
+        "lift": "Lift"
+    }
+
+    for metric_key, metric_title in metrics_to_plot.items():
+        # Create a dictionary for this metric, mapping season to data
+        single_metric_data = {
+            season: seasonal_data_dict[season][metric_key] for season in seasons.keys()
+        }
+
+        # Define filename and output path
+        filename = f"combined_seasonal_{metric_key}"
+
+        print(f"Generating combined seasonal subplot for: {metric_title}")
+        plot_seasonal_subfigures(single_metric_data, output_dir, filename, metric_title,
+                                 lon_min, lon_max, lat_min, lat_max, lons, lats)
+
+
 def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, precip_lat_indices, precip_lon_indices,
                  precip_lats, precip_lons, ar_ds, precip_ds,
                  output_dir, analysis_name, lon_min, lon_max, lat_min, lat_max, date_range_str):
@@ -119,7 +219,7 @@ def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, pre
 
     if len(ar_indices) == 0:
         print(f"Skipping {analysis_name} due to no common time steps.")
-        return
+        return None
 
     # --- Optimized Data Reading and Calculation ---
     print("Reading data slices...")
@@ -163,41 +263,44 @@ def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, pre
         print(f"Applying spatial smoothing with window size {spatial_smoothing_window_size}...")
         p_ext_ar = uniform_filter(p_ext_ar, size=spatial_smoothing_window_size, mode='nearest')
         p_ext_no_ar = uniform_filter(p_ext_no_ar, size=spatial_smoothing_window_size, mode='nearest')
+        paf = uniform_filter(paf, size=spatial_smoothing_window_size, mode='nearest')
+        af = uniform_filter(af, size=spatial_smoothing_window_size, mode='nearest')
         lift = uniform_filter(lift, size=spatial_smoothing_window_size, mode='nearest')
         p_sig = uniform_filter(p_sig, size=spatial_smoothing_window_size, mode='nearest')
-
-    # --- Generate Plots ---
-    print("Generating plots...")
 
     # Create a boolean mask for significant areas
     sig_mask_bool = p_sig < sig_level
 
     # Create masked data arrays for plotting only significant regions
-    p_ext_ar_sig = np.where(sig_mask_bool, p_ext_ar, np.nan)
-    p_ext_no_ar_sig = np.where(sig_mask_bool, p_ext_no_ar, np.nan)
-    paf_sig = np.where(sig_mask_bool, paf, np.nan)
-    af_sig = np.where(sig_mask_bool, af, np.nan)
-    lift_sig = np.where(sig_mask_bool, lift, np.nan)
+    metrics = {
+        "p_ext_ar": np.where(sig_mask_bool, p_ext_ar, np.nan),
+        "p_ext_no_ar": np.where(sig_mask_bool, p_ext_no_ar, np.nan),
+        "paf": np.where(sig_mask_bool, paf, np.nan),
+        "af": np.where(sig_mask_bool, af, np.nan),
+        "lift": np.where(sig_mask_bool, lift, np.nan)
+    }
 
-    # Now, call plot_map with the masked data.
-    # The sig_mask parameter is no longer needed since we are only plotting significant data.
-    plot_map(p_ext_ar_sig, 'P(Extreme | AR) (Significant Areas)', 'p_ext_ar_sig', output_dir, analysis_name,
+    # --- Generate Plots ---
+    print("Generating plots...")
+
+    plot_map(metrics["p_ext_ar"], 'P(Extreme | AR) (Significant Areas)', 'p_ext_ar_sig', output_dir, analysis_name,
              sig_mask=None, lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max, lat_min=lat_min,
              lat_max=lat_max, date_range_str=date_range_str)
 
-    plot_map(p_ext_no_ar_sig, 'P(Extreme | No AR) (Significant Areas)', 'p_ext_no_ar_sig', output_dir, analysis_name,
+    plot_map(metrics["p_ext_no_ar"], 'P(Extreme | No AR) (Significant Areas)', 'p_ext_no_ar_sig', output_dir,
+             analysis_name,
              sig_mask=None, lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max, lat_min=lat_min,
              lat_max=lat_max, date_range_str=date_range_str)
 
-    plot_map(paf_sig, "PAF (Significant Areas)", "paf_sig", output_dir, analysis_name, sig_mask=None,
+    plot_map(metrics["paf"], "PAF (Significant Areas)", "paf_sig", output_dir, analysis_name, sig_mask=None,
              cmap="coolwarm", lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max,
              lat_min=lat_min, lat_max=lat_max, date_range_str=date_range_str)
 
-    plot_map(af_sig, "AF (Significant Areas)", "af_sig", output_dir, analysis_name, vmin=0,
+    plot_map(metrics["af"], "AF (Significant Areas)", "af_sig", output_dir, analysis_name, vmin=0,
              sig_mask=None, cmap="coolwarm", lons=precip_lons, lats=precip_lats, lon_min=lon_min,
              lon_max=lon_max, lat_min=lat_min, lat_max=lat_max, date_range_str=date_range_str)
 
-    plot_map(lift_sig, 'Lift (Significant Areas)', 'lift_sig', output_dir, analysis_name,
+    plot_map(metrics["lift"], 'Lift (Significant Areas)', 'lift_sig', output_dir, analysis_name,
              sig_mask=None, lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max,
              lat_min=lat_min, lat_max=lat_max, date_range_str=date_range_str)
 
@@ -209,9 +312,6 @@ def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, pre
     with open(f"{output_dir}/summary_stats_{analysis_name}.txt", "w") as f:
         f.write(f"--- Summary Statistics for {analysis_name} ---\n")
         f.write(f"Date Range: {date_range_str}\n\n")
-
-        metrics = {"P(Extreme | AR)": p_ext_ar, "P(Extreme | No AR)": p_ext_no_ar,
-                   "AF": af, "PAF": paf, "Lift": lift}
 
         for name, data in metrics.items():
             f.write(f"--- {name} ---\n")
@@ -225,6 +325,8 @@ def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, pre
         f.write(f"Significant grid points (p < {sig_level}): {np.sum(p_sig < sig_level)}\n")
 
     print(f"Analysis for {analysis_name} complete. Output saved to: {output_dir}")
+
+    return metrics
 
 
 if __name__ == "__main__":
@@ -339,6 +441,8 @@ if __name__ == "__main__":
     if ar_lats_global.size > 1 and ar_lats_global[0] > ar_lats_global[-1]:
         ar_lat_indices_global = ar_lat_indices_global[::-1]
 
+    seasonal_metrics_data = {metric: {} for metric in ["p_ext_ar", "p_ext_no_ar", "paf", "af", "lift"]}
+
     for season_name, months in seasons.items():
         seasonal_mask = np.array([date.month in months for date in common_dates])
 
@@ -347,13 +451,29 @@ if __name__ == "__main__":
 
         season_output_dir = os.path.join(base_output_dir, "seasonal", season_name)
 
-        run_analysis(seasonal_ar_indices, seasonal_precip_indices,
-                     ar_lat_indices_global, ar_lon_indices_global, precip_lat_indices_global, precip_lon_indices_global,
-                     precip_lats_global, precip_lons_global, ar_ds, precip_ds,
-                     season_output_dir, f"Global_{season_name}", lon_min_g, lon_max_g, lat_min_g, lat_max_g,
-                     date_range_str_for_output)
+        # The run_analysis function now returns the dictionary of metrics
+        metrics_data = run_analysis(seasonal_ar_indices, seasonal_precip_indices,
+                                    ar_lat_indices_global, ar_lon_indices_global, precip_lat_indices_global,
+                                    precip_lon_indices_global,
+                                    precip_lats_global, precip_lons_global, ar_ds, precip_ds,
+                                    season_output_dir, f"Global_{season_name}", lon_min_g, lon_max_g, lat_min_g,
+                                    lat_max_g,
+                                    date_range_str_for_output)
+
+        # Store the returned data for the multi-plot
+        if metrics_data is not None:
+            for metric_key, data in metrics_data.items():
+                seasonal_metrics_data[metric_key][season_name] = data
+
+    # --- GENERATE COMBINED SEASONAL SUBPLOTS ---
+    if seasonal_metrics_data:
+        print("\n--- Generating Combined Seasonal Subplots for all metrics ---")
+        combined_output_dir = os.path.join(base_output_dir, "seasonal_combined")
+        plot_all_seasonal_subfigures(seasonal_metrics_data, combined_output_dir,
+                                     lon_min_g, lon_max_g, lat_min_g, lat_max_g,
+                                     precip_lons_global, precip_lats_global)
+        print("Combined seasonal subplots saved.")
 
     print("\nAll analyses finished.")
     ar_ds.close()
     precip_ds.close()
-
