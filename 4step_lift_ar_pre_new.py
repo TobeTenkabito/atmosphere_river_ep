@@ -17,13 +17,19 @@ from tqdm import tqdm
 import multiprocessing as mp
 from matplotlib.colors import LinearSegmentedColormap
 import os
+import itertools  # Import itertools for sequential Fisher test
 
 # --- Configuration ---
 spatial_smoothing_window_size = 1
 sig_level = 0.05
 lift_cap_percentile = 95
 lift_max_val = 100
+bootstrap_iterations = 1000  # Number of bootstrap samples for CI calculation
 base_output_dir = "G:/ar_analysis/output_seasonal_regional"
+
+# --- File Paths (for passing to parallel workers) ---
+AR_FILE_PATH = 'G:/ar_analysis/ar_happen.nc'
+PRECIP_FILE_PATH = 'G:/ar_analysis/data/extreme_precipitation.nc'
 
 # Create base output directory if it doesn't exist
 os.makedirs(base_output_dir, exist_ok=True)
@@ -46,22 +52,6 @@ seasons = {
 }
 
 
-# Worker function for the multiprocessing pool.
-def fisher_worker(args):
-    """Worker function for the multiprocessing pool."""
-    i, j, a, b, c, d = args
-    table = [[a, b], [c, d]]
-    if np.sum(table) > 0:
-        _, p = fisher_exact(table)
-        return i, j, p
-    return i, j, np.nan
-
-
-def create_custom_cmap(colors, name='custom_cmap'):
-    """Creates a custom colormap from a list of colors."""
-    return LinearSegmentedColormap.from_list(name, colors)
-
-
 def plot_map(data, title, filename, output_dir, region_name, vmin=None, vmax=None, sig_mask=None, cmap='viridis',
              n_levels=7, lon_min=100, lon_max=150, lat_min=10, lat_max=60, lons=None, lats=None, date_range_str=""):
     """Enhanced plotting function to handle regional plotting."""
@@ -77,22 +67,24 @@ def plot_map(data, title, filename, output_dir, region_name, vmin=None, vmax=Non
     if vmin is None or vmax is None:
         valid_data = data[~np.isnan(data)]
         if len(valid_data) > 0:
-            vmin = np.nanmin(valid_data) if vmin is None else vmin
-            vmax = np.nanmax(valid_data) if vmax is None else vmax
+            vmin_calc = np.nanmin(valid_data) if vmin is None else vmin
+            vmax_calc = np.nanmax(valid_data) if vmax is None else vmax
+            # Apply the user's requested lower bound for PAF and AF
+            if title.startswith("PAF") or title.startswith("AF"):
+                vmin_calc = max(0, vmin_calc)
+            vmin = vmin_calc
+            vmax = vmax_calc
         else:
             vmin, vmax = 0, 1
 
     levels = np.linspace(vmin, vmax, n_levels + 1)
 
-    # Use pcolormesh for better representation of grid cell data
     mesh = ax.pcolormesh(lons, lats, data, cmap=cmap, vmin=vmin, vmax=vmax,
                          transform=ccrs.PlateCarree())
 
-    # Add contour lines for better visualization (optional but recommended)
     ax.contour(lons, lats, data, levels=levels, colors='black', linewidths=0.5, transform=ccrs.PlateCarree())
 
     if sig_mask is not None:
-        # Use hatching for significant areas, ensuring it aligns with the pcolormesh grid
         significant_mask = np.where(sig_mask < sig_level, 1, np.nan)
         ax.contourf(lons, lats, significant_mask, levels=[0.5, 1.5],
                     colors='none', hatches=['...'], transform=ccrs.PlateCarree())
@@ -103,7 +95,6 @@ def plot_map(data, title, filename, output_dir, region_name, vmin=None, vmax=Non
     full_title = f"{title} for {region_name}\n{date_range_str}"
     plt.title(full_title, fontsize=14)
 
-    # Ensure the output directory exists
     os.makedirs(output_dir, exist_ok=True)
     plt.savefig(f"{output_dir}/{filename}.png", dpi=300, bbox_inches='tight')
     plt.close()
@@ -113,79 +104,57 @@ def plot_seasonal_subfigures(seasonal_data, output_dir, filename, title, lon_min
                              lats):
     """
     Plots a 2x2 grid of subfigures for seasonal analysis of a single metric.
-    The main title is placed on the top-left subplot.
-    The legend is placed at the bottom center of the entire figure.
     """
-    # Find global min and max for all seasons to ensure consistent colorbar
     all_data = np.concatenate([d.flatten() for d in seasonal_data.values()])
     vmin = np.nanmin(all_data) if not np.all(np.isnan(all_data)) else 0
     vmax = np.nanmax(all_data) if not np.all(np.isnan(all_data)) else 1
 
-    # Special handling for PAF to ensure colorbar is symmetric around zero
-    if title == "PAF":
-        abs_max = max(abs(vmin), abs(vmax))
-        vmin = -abs_max
-        vmax = abs_max
+    if title in ["PAF", "AF"]:
+        vmin = 0
+
+    cmap = 'viridis' if title == "Lift" else 'coolwarm'
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10), subplot_kw={'projection': ccrs.PlateCarree()})
-
-    # Subplot labels
     subplot_labels = ["(a)", "(b)", "(c)", "(d)"]
-
-    # Iterate through each season and plot to the corresponding subplot
     seasons_list = list(seasons.keys())
+
     for i, season_name in enumerate(seasons_list):
         row, col = i // 2, i % 2
         ax = axes[row, col]
-        data = seasonal_data[season_name]
+        data = seasonal_data.get(season_name, np.full(lats.shape, np.nan))  # Handle missing seasons
 
-        # Plotting
-        mesh = ax.pcolormesh(lons, lats, data, cmap='coolwarm', vmin=vmin, vmax=vmax,
+        mesh = ax.pcolormesh(lons, lats, data, cmap=cmap, vmin=vmin, vmax=vmax,
                              transform=ccrs.PlateCarree())
-
-        # Add coastlines, borders, and gridlines
         ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
         ax.add_feature(cfeature.LAND, facecolor='#D3D3D3')
         ax.add_feature(cfeature.OCEAN, facecolor='#E6F0FA')
         ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
         ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.8)
 
-        # Only show lat/lon labels on the left and bottom subplots
-        draw_labels_left = col == 0
-        draw_labels_bottom = row == 1
         gl = ax.gridlines(draw_labels=True, linestyle='--', alpha=0.3)
         gl.top_labels = False
         gl.right_labels = False
-        if not draw_labels_left:
-            gl.left_labels = False
-        if not draw_labels_bottom:
-            gl.bottom_labels = False
+        gl.left_labels = (col == 0)
+        gl.bottom_labels = (row == 1)
 
-        # Add (a), (b), (c), (d) labels to the top-left corner
         ax.text(0.02, 0.98, subplot_labels[i], transform=ax.transAxes,
                 fontsize=14, fontweight='bold', va='top', ha='left')
-
-        # Add seasonal identifier to the top-right corner
         ax.text(0.98, 0.98, season_name, transform=ax.transAxes,
                 fontsize=12, va='top', ha='right')
 
-    # Adjust spacing between subplots
     plt.tight_layout(rect=[0, 0.1, 1, 0.95])
-
-    # Add a common colorbar at the bottom center of the entire figure
     cbar_ax = fig.add_axes([0.15, 0.05, 0.7, 0.02])
     cbar = fig.colorbar(mesh, cax=cbar_ax, orientation='horizontal')
     cbar.set_label(f'{title} Value', fontsize=12)
 
-    # Save the figure
     os.makedirs(output_dir, exist_ok=True)
     plt.savefig(f"{output_dir}/{filename}.png", dpi=300, bbox_inches='tight')
     plt.close()
 
 
-def plot_all_seasonal_subfigures(seasonal_data_dict, output_dir, lon_min, lon_max, lat_min, lat_max, lons, lats):
+def plot_all_seasonal_subfigures(seasonal_results, output_dir, lon_min, lon_max, lat_min, lat_max, lons, lats):
     """
-    Orchestrates the plotting of all seasonal subfigures for each metric.
+    Orchestrates plotting for all metrics based on collected seasonal results.
     """
     metrics_to_plot = {
         "p_ext_ar": "P(Extreme | AR)",
@@ -195,17 +164,24 @@ def plot_all_seasonal_subfigures(seasonal_data_dict, output_dir, lon_min, lon_ma
         "lift": "Lift"
     }
 
-    for metric_key, metric_title in metrics_to_plot.items():
-        # Create a dictionary for this metric, mapping season to data
-        single_metric_data = {
-            season: seasonal_data_dict[season][metric_key] for season in seasons.keys()
-        }
+    # Restructure data from a list of dicts to a dict of dicts
+    seasonal_data_dict = {metric: {} for metric in metrics_to_plot.keys()}
+    for result in seasonal_results:
+        if result:  # Check if result is not None
+            season_name = result['analysis_name'].split('_')[-1]
+            for metric_key in metrics_to_plot.keys():
+                seasonal_data_dict[metric_key][season_name] = result['metrics'][metric_key]
 
-        # Define filename and output path
+    for metric_key, metric_title in metrics_to_plot.items():
+        if not seasonal_data_dict[metric_key]:
+            print(f"Skipping combined plot for {metric_title} due to missing seasonal data.")
+            continue
+
         filename = f"combined_seasonal_{metric_key}"
+        combined_output_dir = os.path.join(output_dir, "seasonal_combined")
 
         print(f"Generating combined seasonal subplot for: {metric_title}")
-        plot_seasonal_subfigures(single_metric_data, output_dir, filename, metric_title,
+        plot_seasonal_subfigures(seasonal_data_dict[metric_key], combined_output_dir, filename, metric_title,
                                  lon_min, lon_max, lat_min, lat_max, lons, lats)
 
 
@@ -213,28 +189,55 @@ def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, pre
                  precip_lats, precip_lons, ar_ds, precip_ds,
                  output_dir, analysis_name, lon_min, lon_max, lat_min, lat_max, date_range_str):
     """
-    Encapsulates the core data processing, statistical analysis, and plotting logic.
+    Core analysis logic for a single region/season. Now runs sequentially internally.
     """
-    print(f"\n--- Starting Analysis for: {analysis_name} ---")
+    print(f"\n--- [PID:{os.getpid()}] Starting Analysis for: {analysis_name} ---")
 
     if len(ar_indices) == 0:
         print(f"Skipping {analysis_name} due to no common time steps.")
         return None
 
-    # --- Optimized Data Reading and Calculation ---
-    print("Reading data slices...")
-    ar_data = ar_ds.variables['ar_happen'][ar_indices, ar_lat_indices, ar_lon_indices].astype(np.int8)
-    precip_data = precip_ds.variables['extreme_precipitation_flag'][
-        precip_indices, precip_lat_indices, precip_lon_indices].astype(np.int8)
+    ar_data = ar_ds.variables['ar_happen'][ar_indices, :, :][:, ar_lat_indices, :][:, :, ar_lon_indices].astype(np.int8)
+    precip_data = precip_ds.variables['extreme_precipitation_flag'][precip_indices, :, :][:, precip_lat_indices, :][:,
+                  :, precip_lon_indices].astype(np.int8)
 
-    print("Calculating contingency table...")
     A = np.sum((ar_data == 1) & (precip_data == 1), axis=0)
     B = np.sum((ar_data == 1) & (precip_data == 0), axis=0)
     C = np.sum((ar_data == 0) & (precip_data == 1), axis=0)
     D = np.sum((ar_data == 0) & (precip_data == 0), axis=0)
 
+    # --- Bootstrap Resampling (Sequential) ---
+    n_timesteps = len(ar_indices)
+    bootstrap_mean_paf = []
+    bootstrap_mean_af = []
+
+    for _ in range(bootstrap_iterations):
+        resample_indices = np.random.choice(n_timesteps, n_timesteps, replace=True)
+        ar_resampled = ar_data[resample_indices, :, :]
+        precip_resampled = precip_data[resample_indices, :, :]
+        A_boot = np.sum((ar_resampled == 1) & (precip_resampled == 1), axis=0)
+        B_boot = np.sum((ar_resampled == 1) & (precip_resampled == 0), axis=0)
+        C_boot = np.sum((ar_resampled == 0) & (precip_resampled == 1), axis=0)
+        D_boot = np.sum((ar_resampled == 0) & (precip_resampled == 0), axis=0)
+
+        p_ext_ar_boot = np.where((A_boot + B_boot) > 0, A_boot / (A_boot + B_boot), np.nan)
+        p_ext_no_ar_boot = np.where((C_boot + D_boot) > 0, C_boot / (C_boot + D_boot), np.nan)
+        frequency_e_boot = (A_boot + C_boot) / n_timesteps
+        p_no_ar_boot = (C_boot + D_boot) / n_timesteps
+
+        paf_boot = np.where(frequency_e_boot > 0,
+                            (frequency_e_boot - p_no_ar_boot * p_ext_no_ar_boot) / frequency_e_boot, np.nan)
+        af_boot = np.where(p_ext_ar_boot > 0, (p_ext_ar_boot - p_ext_no_ar_boot) / p_ext_ar_boot, np.nan)
+
+        bootstrap_mean_paf.append(np.nanmean(paf_boot))
+        bootstrap_mean_af.append(np.nanmean(af_boot))
+
+    paf_ci_95 = np.percentile(bootstrap_mean_paf, [2.5, 97.5])
+    af_ci_95 = np.percentile(bootstrap_mean_af, [2.5, 97.5])
+
     del ar_data, precip_data
 
+    # --- Calculate Main Metrics ---
     p_no_ar = np.where((A + B + C + D) > 0, (C + D) / (A + B + C + D), np.nan)
     frequency_e = np.where((A + B + C + D) > 0, (A + C) / (A + B + C + D), np.nan)
     p_ext_ar = np.where((A + B) > 0, A / (A + B), np.nan)
@@ -245,22 +248,16 @@ def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, pre
     lift_upper_bound = np.nanpercentile(lift, lift_cap_percentile)
     lift = np.where(lift > lift_upper_bound, lift_upper_bound, lift)
 
-    # --- Parallelized Fisher Exact Test ---
-    print("Running Fisher Exact Test (Parallelized)...")
+    # --- Fisher Exact Test (Sequential) ---
     p_sig = np.full(A.shape, np.nan)
-    coords = [(i, j, A[i, j], B[i, j], C[i, j], D[i, j])
-              for i in range(A.shape[0]) for j in range(A.shape[1])]
-
-    with mp.Pool(mp.cpu_count()) as pool:
-        results = list(
-            tqdm(pool.imap(fisher_worker, coords), total=len(coords), desc=f"Fisher Test for {analysis_name}"))
-
-    for i, j, p in results:
-        p_sig[i, j] = p
+    for i, j in itertools.product(range(A.shape[0]), range(A.shape[1])):
+        table = [[A[i, j], B[i, j]], [C[i, j], D[i, j]]]
+        if np.sum(table) > 0:
+            _, p = fisher_exact(table)
+            p_sig[i, j] = p
 
     # --- Spatial Smoothing ---
     if spatial_smoothing_window_size > 1:
-        print(f"Applying spatial smoothing with window size {spatial_smoothing_window_size}...")
         p_ext_ar = uniform_filter(p_ext_ar, size=spatial_smoothing_window_size, mode='nearest')
         p_ext_no_ar = uniform_filter(p_ext_no_ar, size=spatial_smoothing_window_size, mode='nearest')
         paf = uniform_filter(paf, size=spatial_smoothing_window_size, mode='nearest')
@@ -268,10 +265,7 @@ def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, pre
         lift = uniform_filter(lift, size=spatial_smoothing_window_size, mode='nearest')
         p_sig = uniform_filter(p_sig, size=spatial_smoothing_window_size, mode='nearest')
 
-    # Create a boolean mask for significant areas
     sig_mask_bool = p_sig < sig_level
-
-    # Create masked data arrays for plotting only significant regions
     metrics = {
         "p_ext_ar": np.where(sig_mask_bool, p_ext_ar, np.nan),
         "p_ext_no_ar": np.where(sig_mask_bool, p_ext_no_ar, np.nan),
@@ -281,71 +275,63 @@ def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, pre
     }
 
     # --- Generate Plots ---
-    print("Generating plots...")
-
     plot_map(metrics["p_ext_ar"], 'P(Extreme | AR) (Significant Areas)', 'p_ext_ar_sig', output_dir, analysis_name,
-             sig_mask=None, lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max, lat_min=lat_min,
-             lat_max=lat_max, date_range_str=date_range_str)
-
+             lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max, lat_min=lat_min, lat_max=lat_max,
+             date_range_str=date_range_str)
     plot_map(metrics["p_ext_no_ar"], 'P(Extreme | No AR) (Significant Areas)', 'p_ext_no_ar_sig', output_dir,
-             analysis_name,
-             sig_mask=None, lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max, lat_min=lat_min,
+             analysis_name, lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max, lat_min=lat_min,
              lat_max=lat_max, date_range_str=date_range_str)
-
-    plot_map(metrics["paf"], "PAF (Significant Areas)", "paf_sig", output_dir, analysis_name, sig_mask=None,
-             cmap="coolwarm", lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max,
-             lat_min=lat_min, lat_max=lat_max, date_range_str=date_range_str)
-
-    plot_map(metrics["af"], "AF (Significant Areas)", "af_sig", output_dir, analysis_name, vmin=0,
-             sig_mask=None, cmap="coolwarm", lons=precip_lons, lats=precip_lats, lon_min=lon_min,
-             lon_max=lon_max, lat_min=lat_min, lat_max=lat_max, date_range_str=date_range_str)
-
-    plot_map(metrics["lift"], 'Lift (Significant Areas)', 'lift_sig', output_dir, analysis_name,
-             sig_mask=None, lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max,
-             lat_min=lat_min, lat_max=lat_max, date_range_str=date_range_str)
+    plot_map(metrics["paf"], "PAF (Significant Areas)", "paf_sig", output_dir, analysis_name, cmap="coolwarm",
+             lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max, vmin=0, lat_min=lat_min,
+             lat_max=lat_max, date_range_str=date_range_str)
+    plot_map(metrics["af"], "AF (Significant Areas)", "af_sig", output_dir, analysis_name, vmin=0, cmap="coolwarm",
+             lons=precip_lons, lats=precip_lats, lon_min=lon_min, lon_max=lon_max, lat_min=lat_min, lat_max=lat_max,
+             date_range_str=date_range_str)
+    plot_map(metrics["lift"], 'Lift (Significant Areas)', 'lift_sig', output_dir, analysis_name, lons=precip_lons,
+             lats=precip_lats, lon_min=lon_min, lon_max=lon_max, lat_min=lat_min, lat_max=lat_max,
+             date_range_str=date_range_str)
 
     # --- Summary Statistics ---
     prop_ar_extreme = np.where((A + C) > 0, A / (A + C), np.nan)
     mean_prop_ar_extreme = np.nanmean(prop_ar_extreme)
 
-    os.makedirs(output_dir, exist_ok=True)
     with open(f"{output_dir}/summary_stats_{analysis_name}.txt", "w") as f:
         f.write(f"--- Summary Statistics for {analysis_name} ---\n")
         f.write(f"Date Range: {date_range_str}\n\n")
-
         for name, data in metrics.items():
             f.write(f"--- {name} ---\n")
             f.write(f"  Mean: {np.nanmean(data):.4f}\n")
+            if name == 'paf': f.write(f"  Mean PAF 95% CI: [{paf_ci_95[0]:.4f}, {paf_ci_95[1]:.4f}]\n")
+            if name == 'af': f.write(f"  Mean AF 95% CI: [{af_ci_95[0]:.4f}, {af_ci_95[1]:.4f}]\n")
             f.write(f"  Min:  {np.nanmin(data):.4f}\n")
             f.write(f"  Max:  {np.nanmax(data):.4f}\n\n")
-
         f.write("--- Other Stats ---\n")
         f.write(f"Proportion of Extreme Precipitation Events with AR: {mean_prop_ar_extreme:.4f}\n")
         f.write(f"Effective grid points: {np.sum(~np.isnan(lift))}\n")
         f.write(f"Significant grid points (p < {sig_level}): {np.sum(p_sig < sig_level)}\n")
 
-    print(f"Analysis for {analysis_name} complete. Output saved to: {output_dir}")
+    print(f"--- [PID:{os.getpid()}] Analysis for {analysis_name} complete. ---")
 
-    return metrics
+    # Return metrics for final plotting
+    return {"analysis_name": analysis_name, "metrics": metrics}
+
+
+def main_worker(task_params):
+    """
+    Worker function to unpack parameters and run analysis.
+    Opens datasets within the worker process.
+    """
+    ar_ds = nc.Dataset(AR_FILE_PATH, 'r')
+    precip_ds = nc.Dataset(PRECIP_FILE_PATH, 'r')
+
+    result = run_analysis(**task_params, ar_ds=ar_ds, precip_ds=precip_ds)
+
+    ar_ds.close()
+    precip_ds.close()
+    return result
 
 
 if __name__ == "__main__":
-    # --- Data Loading and Time Matching ---
-    print("Reading NetCDF files...")
-    try:
-        ar_ds = nc.Dataset('G:/ar_analysis/ar_happen.nc', 'r')
-        precip_ds = nc.Dataset('G:/ar_analysis/data/extreme_precipitation.nc', 'r')
-    except FileNotFoundError as e:
-        print(f"Error: One of the input files was not found. {e}")
-        exit()
-
-    ar_time = ar_ds.variables['time'][:]
-    ar_dates = num2date(ar_time, units=ar_ds.variables['time'].units, calendar=ar_ds.variables['time'].calendar)
-    precip_time = precip_ds.variables['time'][:]
-    precip_dates = num2date(precip_time, units=precip_ds.variables['time'].units,
-                            calendar=precip_ds.variables['time'].calendar)
-
-    # --- User Input and Time Indexing ---
     try:
         start_date_input = input("起始日期（YYYY-MM-DD HH:MM:SS）: ")
         end_date_input = input("结束日期（YYYY-MM-DD HH:MM:SS）: ")
@@ -356,124 +342,100 @@ if __name__ == "__main__":
         print("日期格式不正确，请使用 YYYY-MM-DD HH:MM:SS 格式。")
         exit()
 
-    print("Matching dates and finding indices...")
+    # --- Data Loading and Time Matching (in main process) ---
+    print("Reading and matching time coordinates...")
+    with nc.Dataset(AR_FILE_PATH, 'r') as ar_ds, nc.Dataset(PRECIP_FILE_PATH, 'r') as precip_ds:
+        ar_time = ar_ds.variables['time'][:]
+        ar_dates = num2date(ar_time, units=ar_ds.variables['time'].units, calendar=ar_ds.variables['time'].calendar)
+        precip_time = precip_ds.variables['time'][:]
+        precip_dates = num2date(precip_time, units=precip_ds.variables['time'].units,
+                                calendar=precip_ds.variables['time'].calendar)
+
+        precip_lats_all = precip_ds.variables['latitude'][:]
+        precip_lons_all = precip_ds.variables['longitude'][:]
+        ar_lats_all = ar_ds.variables['lat'][:]
+        ar_lons_all = ar_ds.variables['lon'][:]
+
     precip_date_to_idx = {date: idx for idx, date in enumerate(precip_dates)}
-
-    all_ar_indices = []
-    all_precip_indices = []
-    common_dates = []
-
-    # Find common dates within the selected range
+    all_ar_indices, all_precip_indices, common_dates = [], [], []
     for idx, ar_date in enumerate(ar_dates):
-        if start_date <= ar_date <= end_date:
-            if ar_date in precip_date_to_idx:
-                all_ar_indices.append(idx)
-                all_precip_indices.append(precip_date_to_idx[ar_date])
-                common_dates.append(ar_date)
+        if start_date <= ar_date <= end_date and ar_date in precip_date_to_idx:
+            all_ar_indices.append(idx)
+            all_precip_indices.append(precip_date_to_idx[ar_date])
+            common_dates.append(ar_date)
 
-    all_ar_indices = np.array(all_ar_indices)
-    all_precip_indices = np.array(all_precip_indices)
-    common_dates = np.array(common_dates)
-
-    if len(common_dates) == 0:
+    if not common_dates:
         print("没有共同时间！")
         exit()
 
     print(f"共同时间步长：{len(common_dates)}")
 
-    precip_lats_all = precip_ds.variables['latitude'][:]
-    precip_lons_all = precip_ds.variables['longitude'][:]
-    ar_lats_all = ar_ds.variables['lat'][:]
-    ar_lons_all = ar_ds.variables['lon'][:]
+    # --- Prepare all analysis tasks ---
+    tasks = []
 
-    # --- REGIONAL ANALYSIS ---
+    # 1. Regional analysis tasks
     for region_key, region_props in regions.items():
-        lon_min, lon_max = region_props["lon_min"], region_props["lon_max"]
-        lat_min, lat_max = region_props["lat_min"], region_props["lat_max"]
+        lon_min, lon_max, lat_min, lat_max = region_props["lon_min"], region_props["lon_max"], region_props["lat_min"], \
+        region_props["lat_max"]
 
-        # Find spatial indices for the current region for both datasets
-        precip_lat_indices_region = np.where((precip_lats_all >= lat_min) & (precip_lats_all <= lat_max))[0]
-        precip_lon_indices_region = np.where((precip_lons_all >= lon_min) & (precip_lons_all <= lon_max))[0]
-        ar_lat_indices_region = np.where((ar_lats_all >= lat_min) & (ar_lats_all <= lat_max))[0]
-        ar_lon_indices_region = np.where((ar_lons_all >= lon_min) & (ar_lons_all <= lon_max))[0]
+        precip_lat_indices = np.where((precip_lats_all >= lat_min) & (precip_lats_all <= lat_max))[0]
+        precip_lon_indices = np.where((precip_lons_all >= lon_min) & (precip_lons_all <= lon_max))[0]
+        ar_lat_indices = np.where((ar_lats_all >= lat_min) & (ar_lats_all <= lat_max))[0]
+        ar_lon_indices = np.where((ar_lons_all >= lon_min) & (ar_lons_all <= lon_max))[0]
 
-        precip_lats_region = precip_lats_all[precip_lat_indices_region]
-        precip_lons_region = precip_lons_all[precip_lon_indices_region]
-
-        # Handle potential latitude inversions for this region, mirroring original script logic
+        precip_lats_region = precip_lats_all[precip_lat_indices]
         if precip_lats_region.size > 1 and precip_lats_region[0] > precip_lats_region[-1]:
-            precip_lats_region = precip_lats_region[::-1]
-            precip_lat_indices_region = precip_lat_indices_region[::-1]
+            precip_lat_indices = precip_lat_indices[::-1]
 
-        ar_lats_region = ar_lats_all[ar_lat_indices_region]
-        if ar_lats_region.size > 1 and ar_lats_region[0] > ar_lats_region[-1]:
-            ar_lat_indices_region = ar_lat_indices_region[::-1]
+        tasks.append({
+            "ar_indices": all_ar_indices, "precip_indices": all_precip_indices,
+            "ar_lat_indices": ar_lat_indices, "ar_lon_indices": ar_lon_indices,
+            "precip_lat_indices": precip_lat_indices, "precip_lon_indices": precip_lon_indices,
+            "precip_lats": precip_lats_all[precip_lat_indices], "precip_lons": precip_lons_all[precip_lon_indices],
+            "output_dir": os.path.join(base_output_dir, region_props['name']),
+            "analysis_name": region_props['name'], "lon_min": lon_min, "lon_max": lon_max,
+            "lat_min": lat_min, "lat_max": lat_max, "date_range_str": date_range_str_for_output
+        })
 
-        region_output_dir = os.path.join(base_output_dir, region_props['name'])
-
-        run_analysis(all_ar_indices, all_precip_indices,
-                     ar_lat_indices_region, ar_lon_indices_region, precip_lat_indices_region, precip_lon_indices_region,
-                     precip_lats_region, precip_lons_region, ar_ds, precip_ds,
-                     region_output_dir, region_props['name'], lon_min, lon_max, lat_min, lat_max,
-                     date_range_str_for_output)
-
-    # --- SEASONAL ANALYSIS (GLOBAL SCOPE) ---
-    print("\n--- Starting Seasonal Analysis (Global Scope) ---")
+    # 2. Seasonal analysis tasks (Global Scope)
     global_region = regions["All_East_Asia"]
-    lon_min_g, lon_max_g = global_region["lon_min"], global_region["lon_max"]
-    lat_min_g, lat_max_g = global_region["lat_min"], global_region["lat_max"]
+    lon_min_g, lon_max_g, lat_min_g, lat_max_g = global_region["lon_min"], global_region["lon_max"], global_region[
+        "lat_min"], global_region["lat_max"]
+    precip_lat_indices_g = np.where((precip_lats_all >= lat_min_g) & (precip_lats_all <= lat_max_g))[0]
+    precip_lon_indices_g = np.where((precip_lons_all >= lon_min_g) & (precip_lons_all <= lon_max_g))[0]
+    ar_lat_indices_g = np.where((ar_lats_all >= lat_min_g) & (ar_lats_all <= lat_max_g))[0]
+    ar_lon_indices_g = np.where((ar_lons_all >= lon_min_g) & (ar_lons_all <= lon_max_g))[0]
 
-    # Indices for the global scope
-    precip_lat_indices_global = np.where((precip_lats_all >= lat_min_g) & (precip_lats_all <= lat_max_g))[0]
-    precip_lon_indices_global = np.where((precip_lons_all >= lon_min_g) & (precip_lons_all <= lon_max_g))[0]
-    ar_lat_indices_global = np.where((ar_lats_all >= lat_min_g) & (ar_lats_all <= lat_max_g))[0]
-    ar_lon_indices_global = np.where((ar_lons_all >= lon_min_g) & (ar_lons_all <= lon_max_g))[0]
-
-    precip_lats_global = precip_lats_all[precip_lat_indices_global]
-    precip_lons_global = precip_lons_all[precip_lon_indices_global]
-
-    # Handle potential latitude inversions for the global scope
+    precip_lats_global = precip_lats_all[precip_lat_indices_g]
     if precip_lats_global.size > 1 and precip_lats_global[0] > precip_lats_global[-1]:
-        precip_lats_global = precip_lats_global[::-1]
-        precip_lat_indices_global = precip_lat_indices_global[::-1]
-
-    ar_lats_global = ar_lats_all[ar_lat_indices_global]
-    if ar_lats_global.size > 1 and ar_lats_global[0] > ar_lats_global[-1]:
-        ar_lat_indices_global = ar_lat_indices_global[::-1]
-
-    seasonal_metrics_data = {metric: {} for metric in ["p_ext_ar", "p_ext_no_ar", "paf", "af", "lift"]}
+        precip_lat_indices_g = precip_lat_indices_g[::-1]
 
     for season_name, months in seasons.items():
         seasonal_mask = np.array([date.month in months for date in common_dates])
+        tasks.append({
+            "ar_indices": np.array(all_ar_indices)[seasonal_mask],
+            "precip_indices": np.array(all_precip_indices)[seasonal_mask],
+            "ar_lat_indices": ar_lat_indices_g, "ar_lon_indices": ar_lon_indices_g,
+            "precip_lat_indices": precip_lat_indices_g, "precip_lon_indices": precip_lon_indices_g,
+            "precip_lats": precip_lats_all[precip_lat_indices_g], "precip_lons": precip_lons_all[precip_lon_indices_g],
+            "output_dir": os.path.join(base_output_dir, "seasonal", season_name),
+            "analysis_name": f"Global_{season_name}", "lon_min": lon_min_g, "lon_max": lon_max_g,
+            "lat_min": lat_min_g, "lat_max": lat_max_g, "date_range_str": date_range_str_for_output
+        })
 
-        seasonal_ar_indices = all_ar_indices[seasonal_mask]
-        seasonal_precip_indices = all_precip_indices[seasonal_mask]
+    # --- Run all tasks in parallel ---
+    print(f"\nStarting parallel processing for {len(tasks)} tasks...")
+    # Use context manager to ensure the pool is closed properly
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        # Use tqdm to show a progress bar for the parallel tasks
+        results = list(tqdm(pool.imap(main_worker, tasks), total=len(tasks)))
 
-        season_output_dir = os.path.join(base_output_dir, "seasonal", season_name)
+    # --- Post-processing: Generate combined seasonal plots ---
+    print("\n--- Generating Combined Seasonal Subplots ---")
+    seasonal_results = [res for res in results if res and 'Global' in res['analysis_name']]
 
-        # The run_analysis function now returns the dictionary of metrics
-        metrics_data = run_analysis(seasonal_ar_indices, seasonal_precip_indices,
-                                    ar_lat_indices_global, ar_lon_indices_global, precip_lat_indices_global,
-                                    precip_lon_indices_global,
-                                    precip_lats_global, precip_lons_global, ar_ds, precip_ds,
-                                    season_output_dir, f"Global_{season_name}", lon_min_g, lon_max_g, lat_min_g,
-                                    lat_max_g,
-                                    date_range_str_for_output)
-
-        # Store the returned data for the multi-plot
-        if metrics_data is not None:
-            for metric_key, data in metrics_data.items():
-                seasonal_metrics_data[metric_key][season_name] = data
-
-    # --- GENERATE COMBINED SEASONAL SUBPLOTS ---
-    if seasonal_metrics_data:
-        print("\n--- Generating Combined Seasonal Subplots for all metrics ---")
-        combined_output_dir = os.path.join(base_output_dir, "seasonal_combined")
-        plot_all_seasonal_subfigures(seasonal_metrics_data, combined_output_dir,
-                                     lon_min_g, lon_max_g, lat_min_g, lat_max_g,
-                                     precip_lons_global, precip_lats_global)
-        print("Combined seasonal subplots saved.")
+    plot_all_seasonal_subfigures(seasonal_results, base_output_dir,
+                                 lon_min_g, lon_max_g, lat_min_g, lat_max_g,
+                                 precip_lons_all[precip_lon_indices_g], precip_lats_all[precip_lat_indices_g])
 
     print("\nAll analyses finished.")
-    ar_ds.close()
-    precip_ds.close()
