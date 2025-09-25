@@ -18,6 +18,7 @@ import multiprocessing as mp
 from matplotlib.colors import LinearSegmentedColormap
 import os
 import itertools  # Import itertools for sequential Fisher test
+import psutil
 
 # --- Configuration ---
 spatial_smoothing_window_size = 1
@@ -25,7 +26,7 @@ sig_level = 0.05
 lift_cap_percentile = 95
 lift_max_val = 100
 bootstrap_iterations = 1000  # Number of bootstrap samples for CI calculation
-base_output_dir = "G:/ar_analysis/output_seasonal_regional"
+base_output_dir = "G:/ar_analysis/output_seasonal_regional_1"
 
 # --- File Paths (for passing to parallel workers) ---
 AR_FILE_PATH = 'G:/ar_analysis/ar_happen.nc'
@@ -50,6 +51,74 @@ seasons = {
     "SON": [9, 10, 11],
     "DJF": [12, 1, 2]
 }
+
+
+def bootstrap_worker(n_iter, ar_data, precip_data, n_timesteps, D):
+    """单个进程执行 n_iter 次 bootstrap"""
+    paf_list, af_list = [], []
+    rng = np.random.default_rng()  # 每个 worker 独立 RNG
+
+    for _ in range(n_iter):
+        resample_indices = rng.integers(0, n_timesteps, size=n_timesteps)
+
+        A_boot = np.sum((ar_data[resample_indices] == 1) & (precip_data[resample_indices] == 1), axis=0)
+        B_boot = np.sum((ar_data[resample_indices] == 1) & (precip_data[resample_indices] == 0), axis=0)
+        C_boot = np.sum((ar_data[resample_indices] == 0) & (precip_data[resample_indices] == 1), axis=0)
+
+        p_ext_ar_boot = np.where((A_boot + B_boot) > 0, A_boot / (A_boot + B_boot), np.nan)
+        p_ext_no_ar_boot = np.where((C_boot + D) > 0, C_boot / (C_boot + D), np.nan)
+
+        frequency_e_boot = (A_boot + C_boot) / n_timesteps
+        p_no_ar_boot = (C_boot + D) / n_timesteps
+
+        paf_boot = np.where(frequency_e_boot > 0,
+                            (frequency_e_boot - p_no_ar_boot * p_ext_no_ar_boot) / frequency_e_boot, np.nan)
+        af_boot = np.where(p_ext_ar_boot > 0, (p_ext_ar_boot - p_ext_no_ar_boot) / p_ext_ar_boot, np.nan)
+
+        paf_list.append(np.nanmean(paf_boot))
+        af_list.append(np.nanmean(af_boot))
+
+    return paf_list, af_list
+
+
+def adaptive_num_workers(memory_per_worker_gb=2):
+    """根据系统可用内存动态分配进程数"""
+    free_mem = psutil.virtual_memory().available / (1024 ** 3)
+    max_workers = int(free_mem // memory_per_worker_gb)
+    return max(1, min(max_workers, mp.cpu_count()))
+
+
+def run_bootstrap(ar_data, precip_data, n_timesteps, D, bootstrap_iterations, analysis_name):
+    """单核版本，避免和外层 multiprocessing 冲突"""
+    print(f"Running bootstrap ({bootstrap_iterations} iters) for {analysis_name} (single-core)...")
+
+    paf_list, af_list = [], []
+    rng = np.random.default_rng()
+
+    for _ in tqdm(range(bootstrap_iterations), desc=f"Bootstrap for {analysis_name}"):
+        resample_indices = rng.integers(0, n_timesteps, size=n_timesteps)
+
+        A_boot = np.sum((ar_data[resample_indices] == 1) & (precip_data[resample_indices] == 1), axis=0)
+        B_boot = np.sum((ar_data[resample_indices] == 1) & (precip_data[resample_indices] == 0), axis=0)
+        C_boot = np.sum((ar_data[resample_indices] == 0) & (precip_data[resample_indices] == 1), axis=0)
+
+        p_ext_ar_boot = np.where((A_boot + B_boot) > 0, A_boot / (A_boot + B_boot), np.nan)
+        p_ext_no_ar_boot = np.where((C_boot + D) > 0, C_boot / (C_boot + D), np.nan)
+
+        frequency_e_boot = (A_boot + C_boot) / n_timesteps
+        p_no_ar_boot = (C_boot + D) / n_timesteps
+
+        paf_boot = np.where(frequency_e_boot > 0,
+                            (frequency_e_boot - p_no_ar_boot * p_ext_no_ar_boot) / frequency_e_boot, np.nan)
+        af_boot = np.where(p_ext_ar_boot > 0, (p_ext_ar_boot - p_ext_no_ar_boot) / p_ext_ar_boot, np.nan)
+
+        paf_list.append(np.nanmean(paf_boot))
+        af_list.append(np.nanmean(af_boot))
+
+    paf_ci_95 = np.percentile(paf_list, [2.5, 97.5])
+    af_ci_95 = np.percentile(af_list, [2.5, 97.5])
+
+    return paf_ci_95, af_ci_95
 
 
 def plot_map(data, title, filename, output_dir, region_name, vmin=None, vmax=None, sig_mask=None, cmap='viridis',
@@ -185,55 +254,35 @@ def plot_all_seasonal_subfigures(seasonal_results, output_dir, lon_min, lon_max,
                                  lon_min, lon_max, lat_min, lat_max, lons, lats)
 
 
-def run_analysis(ar_indices, precip_indices, ar_lat_indices, ar_lon_indices, precip_lat_indices, precip_lon_indices,
-                 precip_lats, precip_lons, ar_ds, precip_ds,
-                 output_dir, analysis_name, lon_min, lon_max, lat_min, lat_max, date_range_str):
-    """
-    Core analysis logic for a single region/season. Now runs sequentially internally.
-    """
-    print(f"\n--- [PID:{os.getpid()}] Starting Analysis for: {analysis_name} ---")
+def run_analysis(ar_indices, precip_indices,
+                 ar_lat_indices, ar_lon_indices,
+                 precip_lat_indices, precip_lon_indices,
+                 precip_lats, precip_lons,
+                 ar_ds, precip_ds,
+                 output_dir, analysis_name,
+                 lon_min, lon_max, lat_min, lat_max,
+                 date_range_str):
+    print(f"\n--- Starting Analysis for: {analysis_name} ---")
 
     if len(ar_indices) == 0:
         print(f"Skipping {analysis_name} due to no common time steps.")
         return None
 
-    ar_data = ar_ds.variables['ar_happen'][ar_indices, :, :][:, ar_lat_indices, :][:, :, ar_lon_indices].astype(np.int8)
-    precip_data = precip_ds.variables['extreme_precipitation_flag'][precip_indices, :, :][:, precip_lat_indices, :][:,
-                  :, precip_lon_indices].astype(np.int8)
+    # --- Data ---
+    print("Reading data slices...")
+    ar_data = ar_ds.variables['ar_happen'][ar_indices, ar_lat_indices, ar_lon_indices].astype(np.int8)
+    precip_data = precip_ds.variables['extreme_precipitation_flag'][
+        precip_indices, precip_lat_indices, precip_lon_indices].astype(np.int8)
 
+    print("Calculating contingency table...")
     A = np.sum((ar_data == 1) & (precip_data == 1), axis=0)
     B = np.sum((ar_data == 1) & (precip_data == 0), axis=0)
     C = np.sum((ar_data == 0) & (precip_data == 1), axis=0)
     D = np.sum((ar_data == 0) & (precip_data == 0), axis=0)
 
-    # --- Bootstrap Resampling (Sequential) ---
+    # --- Bootstrap 优化版 ---
     n_timesteps = len(ar_indices)
-    bootstrap_mean_paf = []
-    bootstrap_mean_af = []
-
-    for _ in range(bootstrap_iterations):
-        resample_indices = np.random.choice(n_timesteps, n_timesteps, replace=True)
-        ar_resampled = ar_data[resample_indices, :, :]
-        precip_resampled = precip_data[resample_indices, :, :]
-        A_boot = np.sum((ar_resampled == 1) & (precip_resampled == 1), axis=0)
-        B_boot = np.sum((ar_resampled == 1) & (precip_resampled == 0), axis=0)
-        C_boot = np.sum((ar_resampled == 0) & (precip_resampled == 1), axis=0)
-        D_boot = np.sum((ar_resampled == 0) & (precip_resampled == 0), axis=0)
-
-        p_ext_ar_boot = np.where((A_boot + B_boot) > 0, A_boot / (A_boot + B_boot), np.nan)
-        p_ext_no_ar_boot = np.where((C_boot + D_boot) > 0, C_boot / (C_boot + D_boot), np.nan)
-        frequency_e_boot = (A_boot + C_boot) / n_timesteps
-        p_no_ar_boot = (C_boot + D_boot) / n_timesteps
-
-        paf_boot = np.where(frequency_e_boot > 0,
-                            (frequency_e_boot - p_no_ar_boot * p_ext_no_ar_boot) / frequency_e_boot, np.nan)
-        af_boot = np.where(p_ext_ar_boot > 0, (p_ext_ar_boot - p_ext_no_ar_boot) / p_ext_ar_boot, np.nan)
-
-        bootstrap_mean_paf.append(np.nanmean(paf_boot))
-        bootstrap_mean_af.append(np.nanmean(af_boot))
-
-    paf_ci_95 = np.percentile(bootstrap_mean_paf, [2.5, 97.5])
-    af_ci_95 = np.percentile(bootstrap_mean_af, [2.5, 97.5])
+    paf_ci_95, af_ci_95 = run_bootstrap(ar_data, precip_data, n_timesteps, D, bootstrap_iterations, analysis_name)
 
     del ar_data, precip_data
 
