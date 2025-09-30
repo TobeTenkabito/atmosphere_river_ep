@@ -9,3 +9,17 @@ Find the file name as "{number}step_file_name.py" and follow the number to calcu
 The other statistic information is the rest python file.
 
 And this code is tested on the conda;it is unknown whether it can run successfully on the other environment.
+
+The main function is step1 and step4:
+- Handles high-resolution spatiotemporal reanalysis datasets (e.g., 0.25° × 0.25°, 6-hourly).
+- Event-based sampling framework with both **all-control** and **sample-control** modes.
+- Computation of statistical indicators such as:
+  - Odds Ratio (OR)
+  - Attributable Fraction (AF)
+  - Population Attributable Fraction (PAF)
+  - Lift index
+- Grid-based and regional aggregation options.
+- Supports both global and regional domain analysis.
+- Data visualization.
+
+The step2 and step3 is additional exploration, not being the main function.
