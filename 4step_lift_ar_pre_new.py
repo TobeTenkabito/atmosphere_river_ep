@@ -29,7 +29,7 @@ bootstrap_iterations = 1000  # Number of bootstrap samples for CI calculation
 base_output_dir = "G:/ar_analysis/output_seasonal_regional_1"
 
 # --- File Paths (for passing to parallel workers) ---
-AR_FILE_PATH = 'G:/ar_analysis/ar_happen.nc'
+AR_FILE_PATH = '/ar_happen_ERA5.nc'
 PRECIP_FILE_PATH = 'G:/ar_analysis/data/extreme_precipitation.nc'
 
 # Create base output directory if it doesn't exist
@@ -89,7 +89,6 @@ def adaptive_num_workers(memory_per_worker_gb=2):
 
 
 def run_bootstrap(ar_data, precip_data, n_timesteps, D, bootstrap_iterations, analysis_name):
-    """单核版本，避免和外层 multiprocessing 冲突"""
     print(f"Running bootstrap ({bootstrap_iterations} iters) for {analysis_name} (single-core)...")
 
     paf_list, af_list = [], []
@@ -280,7 +279,7 @@ def run_analysis(ar_indices, precip_indices,
     C = np.sum((ar_data == 0) & (precip_data == 1), axis=0)
     D = np.sum((ar_data == 0) & (precip_data == 0), axis=0)
 
-    # --- Bootstrap 优化版 ---
+    # --- Bootstrap optimization ---
     n_timesteps = len(ar_indices)
     paf_ci_95, af_ci_95 = run_bootstrap(ar_data, precip_data, n_timesteps, D, bootstrap_iterations, analysis_name)
 
@@ -293,9 +292,13 @@ def run_analysis(ar_indices, precip_indices,
     p_ext_no_ar = np.where((C + D) > 0, C / (C + D), np.nan)
     paf = np.where(frequency_e > 0, (frequency_e - p_no_ar * p_ext_no_ar) / frequency_e, np.nan)
     af = np.where(p_ext_ar > 0, (p_ext_ar - p_ext_no_ar) / p_ext_ar, np.nan)
-    lift = np.where((p_ext_no_ar > 0), p_ext_ar / p_ext_no_ar, np.nan)
-    lift_upper_bound = np.nanpercentile(lift, lift_cap_percentile)
-    lift = np.where(lift > lift_upper_bound, lift_upper_bound, lift)
+    lift = np.where((p_ext_no_ar > 0), p_ext_ar / frequency_e, np.nan)
+    #lift_upper_bound = np.nanpercentile(lift, lift_cap_percentile)
+    #lift = np.where(lift > lift_upper_bound, lift_upper_bound, lift)
+    paf = np.where(paf < 0, np.nan, paf)
+    af = np.where(af < 0, np.nan, af)
+    lift = np.where(lift < 0, np.nan, lift)
+
 
     # --- Fisher Exact Test (Sequential) ---
     p_sig = np.full(A.shape, np.nan)
@@ -382,13 +385,13 @@ def main_worker(task_params):
 
 if __name__ == "__main__":
     try:
-        start_date_input = input("起始日期（YYYY-MM-DD HH:MM:SS）: ")
-        end_date_input = input("结束日期（YYYY-MM-DD HH:MM:SS）: ")
+        start_date_input = input("here input start date（YYYY-MM-DD HH:MM:SS）: ")
+        end_date_input = input("here input end date（YYYY-MM-DD HH:MM:SS）: ")
         start_date = datetime.strptime(start_date_input, "%Y-%m-%d %H:%M:%S")
         end_date = datetime.strptime(end_date_input, "%Y-%m-%d %H:%M:%S")
         date_range_str_for_output = f"{start_date_input} to {end_date_input}"
     except ValueError:
-        print("日期格式不正确，请使用 YYYY-MM-DD HH:MM:SS 格式。")
+        print("wrong with data format，please follow YYYY-MM-DD HH:MM:SS")
         exit()
 
     # --- Data Loading and Time Matching (in main process) ---
@@ -414,10 +417,10 @@ if __name__ == "__main__":
             common_dates.append(ar_date)
 
     if not common_dates:
-        print("没有共同时间！")
+        print("no time have something in common")
         exit()
 
-    print(f"共同时间步长：{len(common_dates)}")
+    print(f"common time step：{len(common_dates)}")
 
     # --- Prepare all analysis tasks ---
     tasks = []
