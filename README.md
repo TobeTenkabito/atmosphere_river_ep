@@ -23,3 +23,10 @@ The main function is step1 and step4:
 - Data visualization.
 
 The step2 and step3 is additional exploration, not being the main function.
+
+This repository contains code developed during ongoing research.
+The dataset used in the experiments is not publicly available.
+Therefore, the results reported in the related manuscript cannot be 
+fully reproduced with this code alone. 
+
+This code is provided for demonstration and academic review purposes only.
