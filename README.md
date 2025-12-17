@@ -1,61 +1,80 @@
-# Atmosphere_River_EP
+# Atmosphere_River_EP (Geo-Temporal Case-Crossover Modeling)
 
-This repository contains code developed to demonstrate the relationship between **Atmospheric Rivers (ARs)** and **Extreme Precipitation (EP)** events.
+This repository contains the **Python implementation** for a **geo-temporal case-crossover model** used to quantify the robust and persistent relationship between **Atmospheric Rivers (ARs)** and **Extreme Precipitation (EP)** events across East Asia.
 
----
+The methodology focuses on **causal inference** in a spatio-temporal context, utilizing advanced statistical techniques common in epidemiology and biostatistics.
+
+## Technology Stack (Implemented Libraries)
+
+This analysis leverages a high-performance scientific Python stack to handle large-scale spatiotemporal data efficiently:
+
+| **Category** | **Key Libraries** | **Usage** | 
+ | ----- | ----- | ----- | 
+| **Data Ingestion & Storage** | `netCDF4` | Reading and slicing large NetCDF datasets (ERA5 reanalysis). | 
+| **Core Data Manipulation** | `NumPy`, `Pandas` | Efficient array computing, datetime handling, and data structuring. | 
+| **Big Data / Memory** | `SciPy.sparse` (CSC Matrix) | Crucial for handling large, sparse (mostly zero) spatiotemporal grids of extreme events, significantly reducing memory footprint. | 
+| **Statistical Modeling** | `SciPy.stats` | Implementing the core Case-Crossover inference logic (`binomtest` on discordant pairs) and calculating confidence intervals (`norm`). | 
+| **Performance / Parallelism** | `Joblib` | Enabling multi-core parallel processing (`N_JOBS = -1`) for grid-cell level Case-Crossover and Fisher's Exact Tests, drastically cutting down computation time. | 
+| **Geospatial Visualization** | `Matplotlib`, `Cartopy` | Generating publication-quality geographic maps, including custom colormaps, log-scaled ratio plots, and feature overlay (coastlines, borders). | 
 
 ## Repository Structure
-- Files ending with `_v{x}.py` indicate different stable versions of the same function with minor variations.  
-- `{number}step_file_name.py` scripts represent sequential steps of the workflow (follow the numbering order to process data).  
-- `ar_happen_calculate.py` and `precipitation_calculate.py` are the core scripts.  
-- `precipitation_output_v{x}.py` is an alternative for machines with limited storage or Windows systems.  
-- Additional Python scripts provide supporting statistical analyses.  
 
----
+The file naming convention reflects the project's complexity and iterative development:
 
-## Main Workflow
-1. **Input Data**  
-   - ERA5 reanalysis datasets  
-   - Atmospheric River (AR) detection datasets  
+* Files ending with `_v{x}.py` indicate standardized functions managing **statistical robustness checks** and minor variations in model parameters.
 
-2. **Run Core Scripts**  
-   - `ar_happen_calculate.py`  
-   - `precipitation_calculate.py`  
+* Sequential scripts (`{number}step_file_name.py`) outline the end-to-end data processing and analysis workflow.
 
-3. **Optional**  
-   - For storage-limited or Windows systems: run `precipitation_output_v{x}.py` after `precipitation_calculate.py`.  
+**Core Modules:**
 
-4. **Key Steps**  
-   - **Step 1 & Step 4 (main functions):**  
-     - Handle high-resolution spatiotemporal reanalysis datasets (e.g., 0.25° × 0.25°, 6-hourly).  
-     - Event-based sampling with **all-control** and **sample-control** modes.  
-     - Statistical indicators:  
-       - Odds Ratio (OR)  
-       - Attributable Fraction (AF)  
-       - Population Attributable Fraction (PAF)  
-       - Lift Index  
-     - Grid-based and regional aggregation.  
-     - Global and regional domain analysis.  
-     - Visualization of results.  
+* `ar_happen_calculate.py` and `precipitation_calculate.py`: Main modules for **data processing, event identification, and temporal matching**.
 
-   - **Step 2 & Step 3:** exploratory analyses (not central to the framework).  
+* `precipitation_output_v{x}.py`: An alternative script optimized for environments with limited memory/storage, demonstrating efficient **data output handling**.
 
----
+* Additional scripts provide supporting **statistical validation analyses**.
 
-## Environment
-- Developed and tested in **Conda** environments.  
-- Functionality on other environments/operating systems is **not guaranteed**.  
-- Scripts have been primarily tested on **Windows OS**.  
+## Main Workflow & Data Analysis Highlights
 
----
+### Input Data
 
-## Disclaimer
-This repository contains code developed during **ongoing research**.  
-- The datasets used in the experiments are **not publicly available**.  
-- Results reported in the related manuscript **cannot be fully reproduced** with this code alone.  
-- This code is provided **for demonstration and academic review purposes only**.  
+* ERA5 reanalysis datasets (Climate Variables)
 
----
+* Atmospheric River (AR) detection database
 
-## Citation
-If you use this code for academic purposes, please cite the related manuscript once it becomes available.
+### Key Data Science Steps
+
+**1. High-Performance Big Data Handling:**
+
+* **Memory Efficiency:** Utilizing **Compressed Sparse Column (CSC) matrices** (`scipy.sparse`) to represent the spatio-temporal AR and EP event flags. This method is vital for analyzing decades of high-resolution (0.25° x 0.25°, 6-hourly) data on standard computing resources.
+
+* **Ingestion:** Using `netCDF4` for direct, efficient reading and slicing of large climate datasets.
+
+**2. Advanced Sampling & Causal Inference:**
+
+* Implements the **Case-Crossover Design**, a quasi-experimental method designed to control for time-invariant and slowly changing spatial/seasonal confounders.
+
+* **Temporal Matching:** Implements event-based sampling using **Temporal Control Matching** (`all-control`) and **Random Sub-sampling** (`sample-control`).
+
+**3. Statistical Modeling & Validation:**
+
+* **Core Model:** Conditional Logistic Regression (implicitly implemented via **McNemar's Test** and the **Binomial Test** on discordant pairs for grid-cell level analysis).
+
+* **Metrics:** Calculates and visualizes key Epidemiological and Predictive Metrics:
+
+  * **Odds Ratio (OR):** Quantifies the effect size (risk multiplier).
+
+  * **Lift Index:** Calculates the ratio of $P(E|AR) / P(E|\text{no } AR)$ from traditional contingency tables.
+
+  * **Significance:** Applies **Benjamini–Hochberg False Discovery Rate (FDR)** control for robust p-value correction across thousands of grid cells.
+
+**4. Robustness Checks (Placebo Tests):**
+
+* Includes routines for running **Time-shifting** and **Month-shuffling** placebo experiments to demonstrate that the observed AR–EP relationship is genuine, not due to chance, temporal autocorrelation, or seasonal bias.
+
+## Environment & Disclaimer
+
+* Developed and tested primarily in **Conda** environments, often utilized for managing complex scientific Python dependencies.
+
+* **Disclaimer:** The full high-resolution datasets required for exact reproduction are proprietary and not included. The code is structured for **methodological review and demonstration** only, proving the functional implementation of the statistical framework.
+
+**This code is provided for academic review purposes, highlighting the applicant's capability in advanced spatio-temporal data analysis, statistical modeling, and large-scale data processing.**
