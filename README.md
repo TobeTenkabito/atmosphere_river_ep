@@ -6,31 +6,28 @@ The methodology focuses on **causal inference** in a spatio-temporal context, ut
 
 ## Technology Stack (Implemented Libraries)
 
-This analysis leverages a high-performance scientific Python stack to handle large-scale spatiotemporal data efficiently:
+This analysis leverages a high-performance scientific Python stack for efficient handling and processing of large-scale spatiotemporal data:
 
-| **Category** | **Key Libraries** | **Usage** | 
- | ----- | ----- | ----- | 
-| **Data Ingestion & Storage** | `netCDF4` | Reading and slicing large NetCDF datasets (ERA5 reanalysis). | 
-| **Core Data Manipulation** | `NumPy`, `Pandas` | Efficient array computing, datetime handling, and data structuring. | 
-| **Big Data / Memory** | `SciPy.sparse` (CSC Matrix) | Crucial for handling large, sparse (mostly zero) spatiotemporal grids of extreme events, significantly reducing memory footprint. | 
-| **Statistical Modeling** | `SciPy.stats` | Implementing the core Case-Crossover inference logic (`binomtest` on discordant pairs) and calculating confidence intervals (`norm`). | 
-| **Performance / Parallelism** | `Joblib` | Enabling multi-core parallel processing (`N_JOBS = -1`) for grid-cell level Case-Crossover and Fisher's Exact Tests, drastically cutting down computation time. | 
-| **Geospatial Visualization** | `Matplotlib`, `Cartopy` | Generating publication-quality geographic maps, including custom colormaps, log-scaled ratio plots, and feature overlay (coastlines, borders). | 
+| **Category** | **Key Libraries** | **Usage** |
+| :--- | :--- | :--- |
+| **Data Ingestion & Alignment** | **`xarray`**, `netCDF4` | Core tools for reading, slicing, **resampling to daily frequency** (`time='D'`), and aligning massive NetCDF/GRIB datasets. |
+| **Core Data Manipulation** | `NumPy`, `Pandas` | Efficient array computing, datetime indexing, and final data aggregation/CSV export. |
+| **Performance & Parallelism** | **`Joblib`** | **Critical:** Implements multi-core parallel processing across the full spatial domain (all grid points) to drastically speed up diagnostics and statistical testing. |
+| **Advanced Algorithms** | **`NumPy.fft`** | Used for efficient computation of Binary Cross-Correlation (via Fast Fourier Transform) for lag analysis. |
+| **Statistical Modeling** | `SciPy.stats` (Implied) | Implementing core statistical tests (e.g., Binomial Test logic) and confidence interval calculations. |
+| **Geospatial Visualization** | `Matplotlib`, `Cartopy` (Implied) | Generating publication-quality geographic maps, including custom color normalizations (`TwoSlopeNorm`) for correlation plots. |
 
 ## Repository Structure
 
 The file naming convention reflects the project's complexity and iterative development:
 
 * Files ending with `_v{x}.py` indicate standardized functions managing **statistical robustness checks** and minor variations in model parameters.
-
 * Sequential scripts (`{number}step_file_name.py`) outline the end-to-end data processing and analysis workflow.
 
 **Core Modules:**
 
-* `ar_happen_calculate.py` and `precipitation_calculate.py`: Main modules for **data processing, event identification, and temporal matching**.
-
-* `precipitation_output_v{x}.py`: An alternative script optimized for environments with limited memory/storage, demonstrating efficient **data output handling**.
-
+* `ar_happen_calculate.py` and `precipitation_calculate.py`: Main modules for **data cleaning, event identification, and temporal matching**.
+* **`diagnostics_module.py`:** Contains all time series analysis, lag selection, and sequential Monte Carlo simulation logic.
 * Additional scripts provide supporting **statistical validation analyses**.
 
 ## Main Workflow & Data Analysis Highlights
@@ -38,43 +35,39 @@ The file naming convention reflects the project's complexity and iterative devel
 ### Input Data
 
 * ERA5 reanalysis datasets (Climate Variables)
-
 * Atmospheric River (AR) detection database
 
 ### Key Data Science Steps
 
-**1. High-Performance Big Data Handling:**
+**1. Data Wrangling and High-Performance Handling:**
 
-* **Memory Efficiency:** Utilizing **Compressed Sparse Column (CSC) matrices** (`scipy.sparse`) to represent the spatio-temporal AR and EP event flags. This method is vital for analyzing decades of high-resolution (0.25° x 0.25°, 6-hourly) data on standard computing resources.
+* **Data Consistency:** Routines handle complex spatio-temporal alignment: reading data using `xarray` chunks, resampling to a common daily frequency, and ensuring inner-join alignment of time steps (`xr.align`).
+* **Massive Parallelization:** **Crucial:** The `run_spatial_diagnostics` function uses **`Joblib`** to execute independent statistical tests concurrently for every single grid point in the spatial domain.
 
-* **Ingestion:** Using `netCDF4` for direct, efficient reading and slicing of large climate datasets.
+**2. Diagnostics and Optimal Lag Selection (Pre-Modeling):**
 
-**2. Advanced Sampling & Causal Inference:**
+* **Lag Identification:** Employs multiple time series methods to identify the optimal lead-lag relationship (the time shift 'L' that maximizes the relationship):
+    * **Event-Triggered Average (ETA):** E\[A\_{t-tau} | E\_t = 1\] for visual and quantitative lead-lag assessment.
+    * **Binary Cross-Correlation:** Uses **FFT** for fast correlation calculation across a range of lags.
+* **Adaptive Monte Carlo:** Implements a rigorous permutation test (`monthly_shuffle_test`) with **adaptive stopping rules** to ensure $p$-value stability while minimizing computational runtime.
 
-* Implements the **Case-Crossover Design**, a quasi-experimental method designed to control for time-invariant and slowly changing spatial/seasonal confounders.
+**3. Core Case-Crossover Model Execution:**
 
-* **Temporal Matching:** Implements event-based sampling using **Temporal Control Matching** (`all-control`) and **Random Sub-sampling** (`sample-control`).
+* **Design Implementation:** Implements the **Case-Crossover Design** at the optimal lag ($L$) identified in the diagnostics phase. This quasi-experimental design inherently controls for time-invariant and slowly varying spatial/seasonal confounders.
+* **Temporal Matching:** For each EP event, the model selects temporally adjacent **Control Periods** (e.g., matching the same time of day/year) to form the case/control pairs.
+* **Core Calculation:** For each grid cell, the analysis is reduced to a $2\times2$ contingency table of **discordant pairs** (EP event under AR vs. EP event under non-AR control).
 
-**3. Statistical Modeling & Validation:**
+**4. Final Metrics Calculation & Interpretation:**
 
-* **Core Model:** Conditional Logistic Regression (implicitly implemented via **McNemar's Test** and the **Binomial Test** on discordant pairs for grid-cell level analysis).
-
-* **Metrics:** Calculates and visualizes key Epidemiological and Predictive Metrics:
-
-  * **Odds Ratio (OR):** Quantifies the effect size (risk multiplier).
-
-  * **Lift Index:** Calculates the ratio of $P(E|AR) / P(E|\text{no } AR)$ from traditional contingency tables.
-
-  * **Significance:** Applies **Benjamini–Hochberg False Discovery Rate (FDR)** control for robust p-value correction across thousands of grid cells.
-
-**4. Robustness Checks (Placebo Tests):**
-
-* Includes routines for running **Time-shifting** and **Month-shuffling** placebo experiments to demonstrate that the observed AR–EP relationship is genuine, not due to chance, temporal autocorrelation, or seasonal bias.
+* **Causal Risk Quantification:** Calculates the **Pooled Odds Ratio (OR)** from the matched discordant pairs, which serves as the primary measure of association and causal risk (equivalent to Conditional Logistic Regression).
+* **Attributable Fraction (AF & PAF):** Quantifies the ultimate impact metrics:
+    * **Precipitation Efficiency (AF):** The ratio of AR-induced precipitation contribution to total precipitation.
+    * **Population Attributable Fraction (PAF):** The percentage of EP events causally attributable to the AR exposure.
+* **Statistical Validation:** The final results (OR, AF, PAF) are mapped spatially, utilizing the **monthly-shuffled $p$-values** and applying **Benjamini–Hochberg False Discovery Rate (FDR)** correction for robust significance testing across the entire domain.
 
 ## Environment & Disclaimer
 
 * Developed and tested primarily in **Conda** environments, often utilized for managing complex scientific Python dependencies.
-
 * **Disclaimer:** The full high-resolution datasets required for exact reproduction are proprietary and not included. The code is structured for **methodological review and demonstration** only, proving the functional implementation of the statistical framework.
 
 **This code is provided for academic review purposes, highlighting the applicant's capability in advanced spatio-temporal data analysis, statistical modeling, and large-scale data processing.**
