@@ -25,11 +25,11 @@ warnings.filterwarnings('ignore')
 # Time period and season
 season_months = None  # e.g., [5,6,7] for summer; None for no filtering
 # Verification switch
-Time_shifting = True
-Month_shuffling = True
+Time_shifting = False
+Month_shuffling = False
 # Case-crossover settings
-lags = [1]  # Exposure lag days (can be multiple, e.g., [0,1,2])
-control_mode = "sample"  # "sample" or "all"
+lags = [2]  # Exposure lag days (can be multiple, e.g., [0,1,2])
+control_mode = "sample"  # "sample" or "all". If you choose "all",the 95% CI will be a point rather than an interval.
 controls_per_case = 5  # Number of controls to sample per case (if control_mode="sample")
 random_seed = 42  # Random seed for sampling
 # Statistics and significance
@@ -41,7 +41,7 @@ fdr_control = True  # Whether to apply Benjamini–Hochberg FDR control (for gri
 N_JOBS = -1
 # Process this many longitude points at a time to save memory during initial data load.
 # Note: With sparse matrices, memory usage is much lower, so this can often be larger.
-spatial_chunk_size = 100
+spatial_chunk_size = 1000
 
 # Spatial smoothing
 grid_aggregate_size = 1  # If >1, apply a moving window average (e.g., 5 for 5x5)
@@ -59,7 +59,7 @@ os.makedirs(output_dir, exist_ok=True)
 
 # === Regional Analysis Switch and Definitions ===
 # Set to True to run analysis for all defined regions, False to run only on the full East Asia domain.
-RUN_REGIONAL_ANALYSIS = True
+RUN_REGIONAL_ANALYSIS = False
 
 # Sub-regions to analyze within the full East Asia domain
 regions = {
@@ -77,8 +77,8 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 xp = np  # Using NumPy as the primary array library. Sparse operations handle efficiency.
 
 # ========== Dataset Paths ==========
-ar_ds_path = 'G:/ar_analysis/ar_happen.nc'
-precip_ds_path = 'G:/ar_analysis/data/extreme_precipitation.nc'
+ar_ds_path = './ar_happen_ERA5.nc'  # Here input your atmospheric rivers dataset
+precip_ds_path = 'G:/ar_analysis/data/extreme_precipitation.nc'  # Here input your extreme precipitation dataset
 
 if not (os.path.exists(ar_ds_path) and os.path.exists(precip_ds_path)):
     print(f"[ERROR] Cannot find input files. Please check paths:\n- {ar_ds_path}\n- {precip_ds_path}")
@@ -372,7 +372,8 @@ def plot_map(data, lons, lats, title, filename, vmin=None, vmax=None, sig_mask=N
     ax.add_feature(cfeature.LAND, facecolor='#D3D3D3', zorder=0)
     ax.add_feature(cfeature.OCEAN, facecolor='#E6F0FA', zorder=0)
     ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
-    ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.8)
+    ax.add_feature(cfeature.LAKES, facecolor='#e6f0ff', edgecolor='none', alpha=0.9, zorder=2)
+    ax.add_feature(cfeature.RIVERS, edgecolor='#4a90e2', linewidth=0.45, alpha=0.75, zorder=5)
     gl = ax.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
     gl.top_labels = False
     gl.right_labels = False
@@ -382,16 +383,15 @@ def plot_map(data, lons, lats, title, filename, vmin=None, vmax=None, sig_mask=N
         valid_data = data[~np.isnan(data)]
         if len(valid_data) > 0:
             if vmin is None:
-                vmin = np.nanpercentile(valid_data, 1)
+                vmin = np.nanpercentile(valid_data, 0)
             if vmax is None:
-                vmax = np.nanpercentile(valid_data, 99)
+                vmax = np.nanpercentile(valid_data, 100)
         else:
             vmin, vmax = 0, 1
 
     plot_data = data.copy()
     if sig_mask is not None:
         plot_data[~sig_mask] = np.nan
-
     # Create discrete levels based on vmin, vmax, and n_levels
     levels = np.linspace(vmin, vmax, n_levels)
 
@@ -403,69 +403,128 @@ def plot_map(data, lons, lats, title, filename, vmin=None, vmax=None, sig_mask=N
     plt.close()
 
 
-def plot_ratio_map(data, lons, lats, title, filename, sig_mask=None, cmap='coolwarm', n_levels=10, extend='both'):
+def plot_ratio_map(
+    data,
+    lons,
+    lats,
+    title,
+    filename,
+    sig_mask=None,
+    cmap='RdBu_r',
+    n_levels=13,
+    extend='both',
+    min_log_range=0.5
+):
     """
-    Plots a map for ratio-based data (e.g., Odds Ratio, Lift) with a
-    symmetrical color scale centered around 1.0. The range is determined by percentiles
-    to avoid issues with extreme outliers.
+    Plot a map for ratio-based data, such as Risk Ratio, Odds Ratio, or Lift.
+
+    The data are plotted on log10 scale and centered at ratio = 1.
+
+    ratio < 1: decreased risk
+    ratio = 1: neutral
+    ratio > 1: increased risk
+
+    This version does NOT filter or clip extreme values.
     """
+
     plt.figure(figsize=(10, 8))
     ax = plt.axes(projection=ccrs.PlateCarree())
-    ax.set_extent([lons.min(), lons.max(), lats.min(), lats.max()], crs=ccrs.PlateCarree())
+
+    ax.set_extent(
+        [lons.min(), lons.max(), lats.min(), lats.max()],
+        crs=ccrs.PlateCarree()
+    )
+
     ax.add_feature(cfeature.LAND, facecolor='#D3D3D3', zorder=0)
     ax.add_feature(cfeature.OCEAN, facecolor='#E6F0FA', zorder=0)
     ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
-    ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.8)
+    ax.add_feature(cfeature.LAKES, facecolor='#e6f0ff', edgecolor='none', alpha=0.9, zorder=2)
+    ax.add_feature(cfeature.RIVERS, edgecolor='#4a90e2', linewidth=0.45, alpha=0.75, zorder=5)
+
     gl = ax.gridlines(draw_labels=True, linestyle='--', alpha=0.5)
     gl.top_labels = False
     gl.right_labels = False
 
-    valid_data = data[~np.isnan(data) & (data > 0)]
-    if len(valid_data) > 0:
-        log10_data = np.log10(valid_data)
+    # Copy data
+    plot_data = data.copy().astype(float)
 
-        # Calculate percentiles to create a robust, symmetrical range
-        p_min_log = np.nanpercentile(log10_data, 1)
-        p_max_log = np.nanpercentile(log10_data, 99)
+    # Ratio data must be positive for log transformation
+    plot_data[plot_data <= 0] = np.nan
 
-        # Use the larger of the two absolute percentile values for symmetry
-        max_deviation = max(np.abs(p_min_log), np.abs(p_max_log))
-
-        # Add a fallback for cases where the data is too clustered.
-        # This ensures a minimum range for visual clarity.
-        robust_range_threshold = 0.5  # Corresponds to a linear range of approx [0.3, 3.1]
-        if max_deviation < robust_range_threshold:
-            max_deviation = robust_range_threshold
-
-        vmin_log = -max_deviation
-        vmax_log = max_deviation
-        levels = np.linspace(vmin_log, vmax_log, n_levels)
-    else:
-        vmin_log, vmax_log = 0, 1
-        levels = np.linspace(vmin_log, vmax_log, n_levels)
-
-    plot_data = data.copy()
-    plot_data = np.log10(plot_data)
+    # Apply significance mask if provided
     if sig_mask is not None:
         plot_data[~sig_mask] = np.nan
 
-    mesh = ax.contourf(lons, lats, plot_data, levels=levels, cmap=cmap, transform=ccrs.PlateCarree())
+    valid_data = plot_data[~np.isnan(plot_data)]
 
-    # Generate log-spaced ticks and format them
-    num_ticks = 7
-    vmin_linear = 10 ** vmin_log
-    vmax_linear = 10 ** vmax_log
+    if len(valid_data) > 0:
+        log_valid = np.log10(valid_data)
 
-    if n_levels > num_ticks:
-        tick_levels = np.logspace(np.log10(vmin_linear), np.log10(vmax_linear), num_ticks)
+        # Use real min and max, no percentile filtering
+        min_log = np.nanmin(log_valid)
+        max_log = np.nanmax(log_valid)
+
+        # Symmetric range around log10(1) = 0
+        max_deviation = max(abs(min_log), abs(max_log))
+
+        # Avoid too narrow range
+        if max_deviation < min_log_range:
+            max_deviation = min_log_range
+
+        vmin_log = -max_deviation
+        vmax_log = max_deviation
+
     else:
-        tick_levels = np.logspace(np.log10(vmin_linear), np.log10(vmax_linear), n_levels)
+        vmin_log = -min_log_range
+        vmax_log = min_log_range
 
-    # Use a logarithmic colorbar formatter
-    cbar_formatter = LogFormatterSciNotation(base=10, labelOnlyBase=False)
-    cbar = plt.colorbar(mesh, ax=ax, label=title.split('(')[0].strip(), shrink=0.8, extend=extend, ticks=tick_levels,
-                        format=cbar_formatter)
+    # Log10-transform data
+    log_plot_data = np.log10(plot_data)
+
+    # Discrete levels on log10 scale
+    levels = np.linspace(vmin_log, vmax_log, n_levels)
+
+    mesh = ax.contourf(
+        lons,
+        lats,
+        log_plot_data,
+        levels=levels,
+        cmap=cmap,
+        extend=extend,
+        transform=ccrs.PlateCarree()
+    )
+
+    # Candidate ratio ticks for colorbar
+    candidate_ticks = np.array([
+        0.01, 0.02, 0.05, 0.1, 0.2, 0.5,
+        0.75, 1,
+        1.25, 1.5, 2, 3, 5, 10, 20, 30, 50, 100
+    ])
+
+    log_candidate_ticks = np.log10(candidate_ticks)
+
+    tick_mask = (
+        (log_candidate_ticks >= vmin_log) &
+        (log_candidate_ticks <= vmax_log)
+    )
+
+    ratio_ticks = candidate_ticks[tick_mask]
+    log_ticks = np.log10(ratio_ticks)
+
+    cbar = plt.colorbar(
+        mesh,
+        ax=ax,
+        shrink=0.8,
+        extend=extend,
+        ticks=log_ticks
+    )
+
+    cbar.set_ticklabels([f'{x:g}' for x in ratio_ticks])
     cbar.set_label(title.split('(')[0].strip(), fontsize=10)
+
+    # Mark ratio = 1 on colorbar
+    if vmin_log <= 0 <= vmax_log:
+        cbar.ax.axhline(0, color='black', linewidth=0.8)
 
     plt.title(f"{title}\n{start_date_input} to {end_date_input}", fontsize=14)
     plt.tight_layout()
@@ -481,11 +540,9 @@ def plot_pooled_or_ci(results_by_lag, region_name, region_name_1):
     ci_upper = [results_by_lag[L]["pooled_OR_ci_upper"] for L in lags_list]
 
     errors = [np.array(pooled_ors) - np.array(ci_lower), np.array(ci_upper) - np.array(pooled_ors)]
-
     plt.figure(figsize=(8, 6))
     plt.bar(lags_list, pooled_ors, yerr=errors, capsize=5, color='skyblue', edgecolor='black')
     plt.axhline(1, color='red', linestyle='--', linewidth=1)
-
     # Adaptive y-axis limits
     y_min = np.min(ci_lower) if ci_lower else 0.5
     y_max = np.max(ci_upper) if ci_upper else 1.5
@@ -524,7 +581,6 @@ def run_regional_analysis(region_name, region_dict,
 
     lon_min, lon_max = region_dict['lon_min'], region_dict['lon_max']
     lat_min, lat_max = region_dict['lat_min'], region_dict['lat_max']
-
     # --- Find regional indices ---
     lat_mask_region = (full_lats >= lat_min) & (full_lats <= lat_max)
     lon_mask_region = (full_lons >= lon_min) & (full_lons <= lon_max)
@@ -615,8 +671,7 @@ def run_regional_analysis(region_name, region_dict,
         # Pooled analysis
         total_n10, total_n01 = np.sum(n10), np.sum(n01)
         pooled_OR = (total_n10 + 0.5) / (total_n01 + 0.5) if (total_n10 + total_n01) > 0 else np.nan
-        pooled_p = binomtest(total_n10, n=(total_n10 + total_n01), p=0.5).pvalue if (
-                                                                                                total_n10 + total_n01) > 0 else np.nan
+        pooled_p = binomtest(total_n10, n=(total_n10 + total_n01), p=0.5).pvalue if (total_n10 + total_n01) > 0 else np.nan
 
         # Pooled CI
         log_pooled_OR = np.log(pooled_OR)
@@ -635,15 +690,11 @@ def run_regional_analysis(region_name, region_dict,
             "pooled_OR_ci_lower": pooled_OR_ci_lower, "pooled_OR_ci_upper": pooled_OR_ci_upper
         }
 
-        # your color styles
-        color0 = create_custom_cmap(['lightblue', 'white', 'thistle'])
-        color1 = create_custom_cmap(['#66CCFF', '#FF9966'])
-
-        vmax = np.nanpercentile(OR_grid[sig_mask], 98) if np.any(sig_mask) else 3.0
-        plot_map(OR_grid, lons_region, lats_region, f"Conditional OR ({region_dict['name']}, lag={L}d)",
-                 f"cc_or_ci_lag{L}_{region_name}", vmin=0.5, vmax=vmax, sig_mask=sig_mask, cmap=color1)
-        plot_ratio_map(OR_grid, lons_region, lats_region, f"Conditional log OR ({region_dict['name']}, lag={L}d)",
-                 f"cc_log_or_lag{L}_{region_name}", sig_mask=sig_mask, cmap=color0)
+        vmax = np.nanpercentile(OR_grid[sig_mask], 100) if np.any(sig_mask) else 3.0
+        plot_map(OR_grid, lons_region, lats_region, f" ",
+                 f"cc_or_ci_lag{L}_{region_name}", vmin=0.5, vmax=vmax, sig_mask=sig_mask, cmap="GnBu")
+        plot_ratio_map(OR_grid, lons_region, lats_region, f" ",
+                 f"cc_log_or_lag{L}_{region_name}", sig_mask=sig_mask, cmap="GnBu")
         plot_map(OR_ci_lower, lons_region, lats_region, f"OR 95% CI Lower Bound ({region_dict['name']}, lag={L}d)",
                  f"cc_or_ci_lower_lag{L}_{region_name}", vmin=0.5, vmax=vmax, sig_mask=sig_mask, cmap='plasma')
         plot_map(OR_ci_upper, lons_region, lats_region, f"OR 95% CI Upper Bound ({region_dict['name']}, lag={L}d)",
@@ -657,7 +708,6 @@ def run_regional_analysis(region_name, region_dict,
         AR_lag = shift_in_time(AR_placebo_sparse, -lag)
         valid_time_mask = np.ones(n_time, dtype=bool)
         if lag > 0: valid_time_mask[:lag] = False
-
         tasks = [
             delayed(process_grid_cell_cc)(
                 EXT_region_sparse[:, i].toarray().flatten(),
