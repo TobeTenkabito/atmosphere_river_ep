@@ -1,0 +1,1275 @@
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import netCDF4 as nc
+from netCDF4 import num2date
+from datetime import datetime
+from scipy.stats import norm
+from tqdm import tqdm
+
+try:
+    from statsmodels.stats.multitest import multipletests
+    HAS_STATSMODELS = True
+except Exception:
+    HAS_STATSMODELS = False
+
+
+# ============================================================
+# 1. Configuration
+# ============================================================
+
+# ---- Input files ----
+AR_FILE = "G:/ar_analysis/ar_happen_ERA5.nc"
+PRECIP_FILE = "G:/ar_analysis/data/extreme_precipitation.nc"
+
+ENSO_FILE = "G:/precipitation/nino3.4.csv"
+MJO_FILE = "G:/precipitation/MJO.csv"
+AO_FILE = "G:/precipitation/AO.csv"
+PDO_FILE = "G:/precipitation/PDO.csv"
+
+# ---- Output directory ----
+OUTPUT_DIR = "G:/ar_analysis/output_mode_lag_scan"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ---- Analysis domain ----
+LON_MIN, LON_MAX = 100, 150
+LAT_MIN, LAT_MAX = 10, 60
+
+# ---- Modes ----
+CONTROL_MODES = ["ENSO", "MJO", "AO", "PDO"]
+
+# ---- Lag scan settings ----
+# ENSO / AO / PDO: months
+# MJO: days
+LAG_SCAN = {
+    "ENSO": [0, 1, 2, 3, 4],
+    "AO": [0, 1, 2],
+    "PDO": [0, 1, 3, 6, 9, 12],
+    "MJO": [0, 3, 5, 7, 10, 12, 15, 20]
+}
+
+MODE_LAG_UNIT = {
+    "ENSO": "month",
+    "AO": "month",
+    "PDO": "month",
+    "MJO": "day"
+}
+
+# ---- MJO phase style ----
+# "detailed": Inactive + Phase_1 ... Phase_8
+# "coarse": Inactive + Active_1to4 + Active_5to8
+MJO_PHASE_STYLE = "detailed"
+
+# ---- Bootstrap settings ----
+RUN_BOOTSTRAP = True
+N_BOOT = 500
+BOOTSTRAP_SEED = 42
+BOOTSTRAP_BLOCK = "month"
+
+# ---- Optional seasonal subset ----
+# 全年分析：None
+# JJA: [6, 7, 8]
+# DJF: [12, 1, 2]
+SEASONAL_MONTHS = None
+
+# ---- Date range ----
+# 如果设为 None，运行时输入
+START_DATE_STR = None
+END_DATE_STR = None
+
+
+# ============================================================
+# 2. Utility functions
+# ============================================================
+
+def safe_divide(a, b):
+    if b == 0 or pd.isna(b):
+        return np.nan
+    return a / b
+
+
+def phase_sort_key(x):
+    """
+    Sort phases in a physically meaningful order.
+    """
+    x = str(x)
+    if x == "Inactive":
+        return 0
+    if x.startswith("Phase_"):
+        try:
+            return int(x.split("_")[1])
+        except Exception:
+            return 99
+    order = {
+        "ElNino": 1,
+        "LaNina": 2,
+        "Neutral": 3,
+        "Negative": 1,
+        "Positive": 2,
+        "Active_1to4": 1,
+        "Active_5to8": 2
+    }
+    return order.get(x, 99)
+
+
+def add_fdr_correction(diff_df):
+    """
+    Add global FDR-corrected q-values for bootstrap p-values.
+    """
+    if diff_df is None or len(diff_df) == 0:
+        return diff_df
+
+    if not HAS_STATSMODELS:
+        return diff_df
+
+    for metric in ["AF", "PAF", "RD", "RR"]:
+        pcol = f"Bootstrap_{metric}_p_two_sided"
+        if pcol not in diff_df.columns:
+            continue
+
+        qcol = f"Bootstrap_{metric}_q_global"
+        sigcol = f"Bootstrap_{metric}_significant_FDR"
+
+        pvals = diff_df[pcol].to_numpy(dtype=float)
+        valid = np.isfinite(pvals)
+
+        qvals = np.full_like(pvals, np.nan, dtype=float)
+        reject = np.full_like(valid, False, dtype=bool)
+
+        if np.sum(valid) > 0:
+            reject_valid, q_valid, _, _ = multipletests(
+                pvals[valid],
+                alpha=0.05,
+                method="fdr_bh"
+            )
+            qvals[valid] = q_valid
+            reject[valid] = reject_valid
+
+        diff_df[qcol] = qvals
+        diff_df[sigcol] = reject
+
+    return diff_df
+
+
+# ============================================================
+# 3. Load climate mode indices
+# ============================================================
+
+def load_enso():
+    df = pd.read_csv(ENSO_FILE, header=1, index_col=0)
+    df.index = pd.to_datetime(df.index, errors="coerce", format="mixed")
+    df = df.dropna(subset=[df.columns[0]])
+
+    values = df.iloc[:, 0].astype(float)
+
+    bucket = pd.Series(index=values.index, dtype="object")
+    bucket[values > 0.5] = "ElNino"
+    bucket[values < -0.5] = "LaNina"
+    bucket[(values >= -0.5) & (values <= 0.5)] = "Neutral"
+
+    return bucket.dropna().sort_index()
+
+
+def load_mjo(style="detailed"):
+    df = pd.read_csv(MJO_FILE, header=2)
+    df.columns = [
+        "year", "month", "day",
+        "RMM1", "RMM2", "RMM_phase", "RMM_amplitude",
+        "RMM_weight", "Column9", "Column10"
+    ]
+
+    df["time"] = pd.to_datetime(df[["year", "month", "day"]], errors="coerce")
+    df = df.dropna(subset=["time"])
+    df = df.set_index("time").sort_index()
+
+    amp = df["RMM_amplitude"].astype(float)
+    phase = df["RMM_phase"].astype(float)
+
+    bucket = pd.Series(index=df.index, dtype="object")
+
+    if style == "coarse":
+        bucket[amp < 1] = "Inactive"
+        bucket[(amp >= 1) & (phase.isin([1, 2, 3, 4]))] = "Active_1to4"
+        bucket[(amp >= 1) & (phase.isin([5, 6, 7, 8]))] = "Active_5to8"
+
+    elif style == "detailed":
+        bucket[amp < 1] = "Inactive"
+        for p in range(1, 9):
+            bucket[(amp >= 1) & (phase == p)] = f"Phase_{p}"
+
+    else:
+        raise ValueError("MJO_PHASE_STYLE must be 'coarse' or 'detailed'.")
+
+    return bucket.dropna().sort_index()
+
+
+def load_ao():
+    df = pd.read_csv(AO_FILE)
+    df["time"] = pd.to_datetime(
+        df["year"].astype(str) + "-" + df["month"].astype(str),
+        format="%Y-%m"
+    )
+    df = df.set_index("time").sort_index()
+
+    values = df["index"].astype(float)
+
+    bucket = pd.Series(index=values.index, dtype="object")
+    bucket[values > 0.5] = "Positive"
+    bucket[values < -0.5] = "Negative"
+    bucket[(values >= -0.5) & (values <= 0.5)] = "Neutral"
+
+    return bucket.dropna().sort_index()
+
+
+def load_pdo():
+    df = pd.read_csv(PDO_FILE)
+
+    df_long = pd.melt(
+        df,
+        id_vars=["Year"],
+        var_name="Month",
+        value_name="index"
+    )
+
+    month_map = {
+        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+        "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
+        "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12
+    }
+
+    df_long["MonthNum"] = df_long["Month"].map(month_map)
+    df_long["time"] = pd.to_datetime(
+        df_long["Year"].astype(str) + "-" + df_long["MonthNum"].astype(str),
+        format="%Y-%m"
+    )
+
+    df_long = df_long.set_index("time").sort_index()
+    values = df_long["index"].astype(float)
+
+    bucket = pd.Series(index=values.index, dtype="object")
+    bucket[values > 0.5] = "Positive"
+    bucket[values < -0.5] = "Negative"
+    bucket[(values >= -0.5) & (values <= 0.5)] = "Neutral"
+
+    return bucket.dropna().sort_index()
+
+
+def shift_monthly_series(series, lag_months):
+    """
+    Positive lag means the mode index is shifted forward.
+    Thus label at date t corresponds to mode state at t-lag.
+    """
+    s = series.copy()
+    s.index = pd.to_datetime(s.index).to_period("M").to_timestamp()
+
+    if lag_months != 0:
+        s.index = s.index + pd.DateOffset(months=lag_months)
+
+    return s.sort_index()
+
+
+def shift_daily_series(series, lag_days):
+    """
+    Positive lag means the mode index is shifted forward.
+    Thus label at date t corresponds to mode state at t-lag.
+    """
+    s = series.copy()
+    s.index = pd.to_datetime(s.index).normalize()
+
+    if lag_days != 0:
+        s.index = s.index + pd.DateOffset(days=lag_days)
+
+    return s.sort_index()
+
+
+def align_monthly_bucket_to_daily(monthly_series, daily_dates):
+    s = monthly_series.copy()
+    s.index = pd.to_datetime(s.index).to_period("M")
+
+    target_month = pd.to_datetime(daily_dates).to_period("M")
+    aligned = s.reindex(target_month)
+
+    return aligned.to_numpy(dtype=object)
+
+
+def align_daily_bucket_to_daily(daily_series, daily_dates):
+    s = daily_series.copy()
+    s.index = pd.to_datetime(s.index).normalize()
+
+    target = pd.to_datetime(daily_dates).normalize()
+    aligned = s.reindex(target)
+
+    return aligned.to_numpy(dtype=object)
+
+
+def load_raw_mode_series():
+    raw = {}
+    if "ENSO" in CONTROL_MODES:
+        raw["ENSO"] = load_enso()
+    if "MJO" in CONTROL_MODES:
+        raw["MJO"] = load_mjo(style=MJO_PHASE_STYLE)
+    if "AO" in CONTROL_MODES:
+        raw["AO"] = load_ao()
+    if "PDO" in CONTROL_MODES:
+        raw["PDO"] = load_pdo()
+    return raw
+
+
+def get_lagged_labels_for_mode(mode, raw_series, dates_pd, lag):
+    unit = MODE_LAG_UNIT[mode]
+
+    if unit == "month":
+        shifted = shift_monthly_series(raw_series, lag)
+        labels = align_monthly_bucket_to_daily(shifted, dates_pd)
+
+    elif unit == "day":
+        shifted = shift_daily_series(raw_series, lag)
+        labels = align_daily_bucket_to_daily(shifted, dates_pd)
+
+    else:
+        raise ValueError(f"Unknown lag unit for mode {mode}: {unit}")
+
+    return labels
+
+
+# ============================================================
+# 4. Pooled statistics
+# ============================================================
+
+def pooled_delta_ci(A, B, C, D, alpha=0.05, cc=0.5):
+    """
+    Regionally pooled estimate and delta-method CI.
+
+    A: AR and EP
+    B: AR and no EP
+    C: no AR and EP
+    D: no AR and no EP
+    """
+    A_raw, B_raw, C_raw, D_raw = int(A), int(B), int(C), int(D)
+
+    A_c = A_raw + (cc if A_raw == 0 else 0)
+    B_c = B_raw + (cc if B_raw == 0 else 0)
+    C_c = C_raw + (cc if C_raw == 0 else 0)
+    D_c = D_raw + (cc if D_raw == 0 else 0)
+
+    n1 = A_c + B_c
+    n0 = C_c + D_c
+    total = A_raw + B_raw + C_raw + D_raw
+
+    if n1 <= 0 or n0 <= 0 or total <= 0:
+        return empty_pooled_result()
+
+    p1 = A_c / n1
+    p0 = C_c / n0
+
+    if p0 <= 0:
+        return empty_pooled_result()
+
+    z = norm.ppf(1 - alpha / 2)
+
+    RD = p1 - p0
+    var_RD = p1 * (1 - p1) / n1 + p0 * (1 - p0) / n0
+    se_RD = np.sqrt(max(var_RD, 0))
+
+    RD_lo = RD - z * se_RD
+    RD_hi = RD + z * se_RD
+
+    RR = p1 / p0
+
+    var_logRR = (1.0 / A_c) - (1.0 / n1) + (1.0 / C_c) - (1.0 / n0)
+    var_logRR = max(var_logRR, 0)
+    se_logRR = np.sqrt(var_logRR)
+
+    RR_lo = np.exp(np.log(RR) - z * se_logRR)
+    RR_hi = np.exp(np.log(RR) + z * se_logRR)
+
+    AF = 1.0 - 1.0 / RR
+    se_AF = se_logRR / RR
+
+    AF_lo = AF - z * se_AF
+    AF_hi = AF + z * se_AF
+
+    p_exp = (A_raw + B_raw) / total
+    ep_frac = (A_raw + C_raw) / total
+
+    denom = 1.0 + p_exp * (RR - 1.0)
+
+    if denom == 0:
+        PAF = np.nan
+        PAF_lo = np.nan
+        PAF_hi = np.nan
+    else:
+        PAF = (p_exp * (RR - 1.0)) / denom
+        deriv = (p_exp * RR) / (denom ** 2)
+        se_PAF = se_logRR * deriv
+        PAF_lo = PAF - z * se_PAF
+        PAF_hi = PAF + z * se_PAF
+
+    return {
+        "pooled_p_ext_ar": p1,
+        "pooled_p_ext_no_ar": p0,
+
+        "pooled_RD": RD,
+        "pooled_RD_lo": RD_lo,
+        "pooled_RD_hi": RD_hi,
+
+        "pooled_RR": RR,
+        "pooled_RR_lo": RR_lo,
+        "pooled_RR_hi": RR_hi,
+
+        "pooled_AF": AF,
+        "pooled_AF_lo": AF_lo,
+        "pooled_AF_hi": AF_hi,
+
+        "pooled_PAF": PAF,
+        "pooled_PAF_lo": PAF_lo,
+        "pooled_PAF_hi": PAF_hi,
+
+        "pooled_AR_fraction": p_exp,
+        "pooled_EP_fraction": ep_frac,
+
+        "A_total": A_raw,
+        "B_total": B_raw,
+        "C_total": C_raw,
+        "D_total": D_raw,
+        "N_total": total
+    }
+
+
+def empty_pooled_result():
+    keys = [
+        "pooled_p_ext_ar", "pooled_p_ext_no_ar",
+        "pooled_RD", "pooled_RD_lo", "pooled_RD_hi",
+        "pooled_RR", "pooled_RR_lo", "pooled_RR_hi",
+        "pooled_AF", "pooled_AF_lo", "pooled_AF_hi",
+        "pooled_PAF", "pooled_PAF_lo", "pooled_PAF_hi",
+        "pooled_AR_fraction", "pooled_EP_fraction",
+        "A_total", "B_total", "C_total", "D_total", "N_total"
+    ]
+    return {k: np.nan for k in keys}
+
+
+def precompute_time_counts(ar_data, precip_data):
+    """
+    Per-time regional pooled counts.
+    This is much faster than recalculating from 3D arrays for every lag.
+    """
+    A_t = np.sum((ar_data == 1) & (precip_data == 1), axis=(1, 2)).astype(np.int64)
+    B_t = np.sum((ar_data == 1) & (precip_data == 0), axis=(1, 2)).astype(np.int64)
+    C_t = np.sum((ar_data == 0) & (precip_data == 1), axis=(1, 2)).astype(np.int64)
+    D_t = np.sum((ar_data == 0) & (precip_data == 0), axis=(1, 2)).astype(np.int64)
+
+    return {
+        "A": A_t,
+        "B": B_t,
+        "C": C_t,
+        "D": D_t
+    }
+
+
+def summarize_phase_pooled(mode, lag, phase, labels, time_counts):
+    labels = np.asarray(labels, dtype=object)
+    idx = np.where(labels == phase)[0]
+
+    if idx.size == 0:
+        return None
+
+    A = int(np.sum(time_counts["A"][idx]))
+    B = int(np.sum(time_counts["B"][idx]))
+    C = int(np.sum(time_counts["C"][idx]))
+    D = int(np.sum(time_counts["D"][idx]))
+
+    pooled = pooled_delta_ci(A, B, C, D)
+
+    row = {
+        "Mode": mode,
+        "Lag": lag,
+        "Lag_unit": MODE_LAG_UNIT[mode],
+        "Phase": phase,
+        "Time_points": int(idx.size)
+    }
+
+    row.update(pooled)
+
+    return row
+
+
+def compute_phase_summary_for_mode_lag(mode, lag, labels, time_counts):
+    labels = np.asarray(labels, dtype=object)
+    valid = pd.notna(labels)
+    phases = sorted(np.unique(labels[valid]), key=phase_sort_key)
+
+    rows = []
+    for phase in phases:
+        row = summarize_phase_pooled(
+            mode=mode,
+            lag=lag,
+            phase=phase,
+            labels=labels,
+            time_counts=time_counts
+        )
+        if row is not None:
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 5. Bootstrap differences
+# ============================================================
+
+def pooled_point_from_counts(A, B, C, D):
+    res = pooled_delta_ci(A, B, C, D)
+    return {
+        "RD": res["pooled_RD"],
+        "RR": res["pooled_RR"],
+        "AF": res["pooled_AF"],
+        "PAF": res["pooled_PAF"]
+    }
+
+
+def build_month_blocks_for_bucket(labels, bucket, dates_pd, time_counts):
+    labels = np.asarray(labels, dtype=object)
+    idx = np.where(labels == bucket)[0]
+
+    if idx.size == 0:
+        return None
+
+    dates_sel = pd.to_datetime(dates_pd[idx])
+    months = dates_sel.to_period("M")
+
+    block_rows = []
+
+    for month in np.unique(months):
+        block_idx = idx[months == month]
+
+        block_rows.append({
+            "month": str(month),
+            "A": int(np.sum(time_counts["A"][block_idx])),
+            "B": int(np.sum(time_counts["B"][block_idx])),
+            "C": int(np.sum(time_counts["C"][block_idx])),
+            "D": int(np.sum(time_counts["D"][block_idx])),
+            "n_time": int(len(block_idx))
+        })
+
+    return pd.DataFrame(block_rows)
+
+
+def bootstrap_pooled_difference(
+    labels,
+    bucket1,
+    bucket2,
+    dates_pd,
+    time_counts,
+    n_boot=500,
+    seed=42
+):
+    rng = np.random.default_rng(seed)
+
+    blocks1 = build_month_blocks_for_bucket(labels, bucket1, dates_pd, time_counts)
+    blocks2 = build_month_blocks_for_bucket(labels, bucket2, dates_pd, time_counts)
+
+    if blocks1 is None or blocks2 is None:
+        return None
+
+    if len(blocks1) < 3 or len(blocks2) < 3:
+        return None
+
+    boot_diffs = {
+        "RD": [],
+        "RR": [],
+        "AF": [],
+        "PAF": []
+    }
+
+    n1 = len(blocks1)
+    n2 = len(blocks2)
+
+    vals1 = blocks1[["A", "B", "C", "D"]].to_numpy()
+    vals2 = blocks2[["A", "B", "C", "D"]].to_numpy()
+
+    for _ in range(n_boot):
+        sample1 = rng.integers(0, n1, size=n1)
+        sample2 = rng.integers(0, n2, size=n2)
+
+        A1, B1, C1, D1 = np.sum(vals1[sample1], axis=0)
+        A2, B2, C2, D2 = np.sum(vals2[sample2], axis=0)
+
+        m1 = pooled_point_from_counts(A1, B1, C1, D1)
+        m2 = pooled_point_from_counts(A2, B2, C2, D2)
+
+        for metric in boot_diffs:
+            boot_diffs[metric].append(m1[metric] - m2[metric])
+
+    out = {}
+
+    for metric, diffs in boot_diffs.items():
+        diffs = np.asarray(diffs, dtype=float)
+        diffs = diffs[np.isfinite(diffs)]
+
+        if diffs.size == 0:
+            out[f"Bootstrap_{metric}_mean_diff"] = np.nan
+            out[f"Bootstrap_{metric}_CI_low"] = np.nan
+            out[f"Bootstrap_{metric}_CI_high"] = np.nan
+            out[f"Bootstrap_{metric}_p_two_sided"] = np.nan
+            out[f"Bootstrap_{metric}_significant"] = False
+            continue
+
+        ci_low, ci_high = np.percentile(diffs, [2.5, 97.5])
+
+        p_two = 2 * min(
+            np.mean(diffs <= 0),
+            np.mean(diffs >= 0)
+        )
+        p_two = min(p_two, 1.0)
+
+        out[f"Bootstrap_{metric}_mean_diff"] = float(np.mean(diffs))
+        out[f"Bootstrap_{metric}_CI_low"] = float(ci_low)
+        out[f"Bootstrap_{metric}_CI_high"] = float(ci_high)
+        out[f"Bootstrap_{metric}_p_two_sided"] = float(p_two)
+        out[f"Bootstrap_{metric}_significant"] = bool((ci_low > 0) or (ci_high < 0))
+
+    out["Bootstrap_blocks_phase1"] = int(n1)
+    out["Bootstrap_blocks_phase2"] = int(n2)
+
+    return out
+
+
+def get_phase_comparisons(mode, available_phases):
+    available = set([str(x) for x in available_phases])
+
+    if mode == "ENSO":
+        pairs = [
+            ("ElNino", "LaNina"),
+            ("ElNino", "Neutral"),
+            ("LaNina", "Neutral")
+        ]
+
+    elif mode == "AO":
+        pairs = [
+            ("Positive", "Negative"),
+            ("Negative", "Neutral"),
+            ("Positive", "Neutral")
+        ]
+
+    elif mode == "PDO":
+        pairs = [
+            ("Positive", "Negative"),
+            ("Positive", "Neutral"),
+            ("Neutral", "Negative")
+        ]
+
+    elif mode == "MJO":
+        if MJO_PHASE_STYLE == "coarse":
+            pairs = [
+                ("Active_1to4", "Active_5to8"),
+                ("Active_1to4", "Inactive"),
+                ("Active_5to8", "Inactive")
+            ]
+        else:
+            pairs = []
+            for p in range(1, 9):
+                pairs.append((f"Phase_{p}", "Inactive"))
+
+            # 额外加入相邻相位差异，便于判断传播结构，但主要结论仍建议用 vs Inactive
+            for p in range(1, 8):
+                pairs.append((f"Phase_{p}", f"Phase_{p+1}"))
+
+    else:
+        pairs = []
+
+    pairs = [(a, b) for a, b in pairs if a in available and b in available]
+    return pairs
+
+
+def compute_pairwise_differences_for_mode_lag(mode, lag, labels, summary_df, dates_pd, time_counts):
+    if summary_df is None or len(summary_df) == 0:
+        return pd.DataFrame()
+
+    available_phases = summary_df["Phase"].astype(str).to_list()
+    pairs = get_phase_comparisons(mode, available_phases)
+
+    rows = []
+
+    for phase1, phase2 in pairs:
+        r1 = summary_df[summary_df["Phase"].astype(str) == phase1].iloc[0]
+        r2 = summary_df[summary_df["Phase"].astype(str) == phase2].iloc[0]
+
+        row = {
+            "Mode": mode,
+            "Lag": lag,
+            "Lag_unit": MODE_LAG_UNIT[mode],
+            "Phase1": phase1,
+            "Phase2": phase2,
+            "Comparison": f"{mode}: {phase1} - {phase2}",
+
+            "Time_points_phase1": int(r1["Time_points"]),
+            "Time_points_phase2": int(r2["Time_points"]),
+
+            "Diff_Pooled_AF": r1["pooled_AF"] - r2["pooled_AF"],
+            "Diff_Pooled_PAF": r1["pooled_PAF"] - r2["pooled_PAF"],
+            "Diff_Pooled_RD": r1["pooled_RD"] - r2["pooled_RD"],
+            "Diff_Pooled_RR": r1["pooled_RR"] - r2["pooled_RR"],
+
+            "Phase1_pooled_AF": r1["pooled_AF"],
+            "Phase2_pooled_AF": r2["pooled_AF"],
+            "Phase1_pooled_PAF": r1["pooled_PAF"],
+            "Phase2_pooled_PAF": r2["pooled_PAF"],
+            "Phase1_pooled_RD": r1["pooled_RD"],
+            "Phase2_pooled_RD": r2["pooled_RD"],
+            "Phase1_pooled_AR_fraction": r1["pooled_AR_fraction"],
+            "Phase2_pooled_AR_fraction": r2["pooled_AR_fraction"],
+            "Phase1_pooled_EP_fraction": r1["pooled_EP_fraction"],
+            "Phase2_pooled_EP_fraction": r2["pooled_EP_fraction"],
+        }
+
+        if RUN_BOOTSTRAP:
+            boot = bootstrap_pooled_difference(
+                labels=labels,
+                bucket1=phase1,
+                bucket2=phase2,
+                dates_pd=dates_pd,
+                time_counts=time_counts,
+                n_boot=N_BOOT,
+                seed=BOOTSTRAP_SEED + int(lag) + len(rows)
+            )
+
+            if boot is not None:
+                row.update(boot)
+            else:
+                row["Bootstrap_note"] = "Not enough blocks or missing phase"
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 6. Lag scan and ranking
+# ============================================================
+
+def run_lag_scan(raw_mode_series, dates_pd, time_counts):
+    all_summary = []
+    all_diffs = []
+
+    for mode in CONTROL_MODES:
+        print(f"\n==============================")
+        print(f"Running lag scan for {mode}")
+        print(f"==============================")
+
+        raw_series = raw_mode_series[mode]
+        lags = LAG_SCAN[mode]
+
+        for lag in lags:
+            print(f"\n--- {mode}, lag={lag} {MODE_LAG_UNIT[mode]} ---")
+
+            labels = get_lagged_labels_for_mode(
+                mode=mode,
+                raw_series=raw_series,
+                dates_pd=dates_pd,
+                lag=lag
+            )
+
+            n_valid = np.sum(pd.notna(labels))
+            print(f"Valid labels: {n_valid}/{len(labels)}")
+
+            if n_valid == 0:
+                continue
+
+            summary_lag = compute_phase_summary_for_mode_lag(
+                mode=mode,
+                lag=lag,
+                labels=labels,
+                time_counts=time_counts
+            )
+
+            if summary_lag is not None and len(summary_lag) > 0:
+                all_summary.append(summary_lag)
+
+            diff_lag = compute_pairwise_differences_for_mode_lag(
+                mode=mode,
+                lag=lag,
+                labels=labels,
+                summary_df=summary_lag,
+                dates_pd=dates_pd,
+                time_counts=time_counts
+            )
+
+            if diff_lag is not None and len(diff_lag) > 0:
+                all_diffs.append(diff_lag)
+
+    summary_df = pd.concat(all_summary, ignore_index=True) if all_summary else pd.DataFrame()
+    diff_df = pd.concat(all_diffs, ignore_index=True) if all_diffs else pd.DataFrame()
+
+    diff_df = add_fdr_correction(diff_df)
+
+    return summary_df, diff_df
+
+
+def build_effect_ranking(diff_df):
+    if diff_df is None or len(diff_df) == 0:
+        return pd.DataFrame()
+
+    df = diff_df.copy()
+
+    for metric in ["AF", "PAF", "RD"]:
+        diff_col = f"Diff_Pooled_{metric}"
+        ci_low_col = f"Bootstrap_{metric}_CI_low"
+        ci_high_col = f"Bootstrap_{metric}_CI_high"
+        q_col = f"Bootstrap_{metric}_q_global"
+        sig_fdr_col = f"Bootstrap_{metric}_significant_FDR"
+
+        pos_col = f"{metric}_positive_FDR"
+        neg_col = f"{metric}_negative_FDR"
+
+        if q_col in df.columns:
+            df[pos_col] = (
+                (df[diff_col] > 0) &
+                (df[ci_low_col] > 0) &
+                (df[q_col] < 0.05)
+            )
+            df[neg_col] = (
+                (df[diff_col] < 0) &
+                (df[ci_high_col] < 0) &
+                (df[q_col] < 0.05)
+            )
+        elif sig_fdr_col in df.columns:
+            df[pos_col] = (
+                (df[diff_col] > 0) &
+                (df[ci_low_col] > 0) &
+                (df[sig_fdr_col])
+            )
+            df[neg_col] = (
+                (df[diff_col] < 0) &
+                (df[ci_high_col] < 0) &
+                (df[sig_fdr_col])
+            )
+        else:
+            df[pos_col] = False
+            df[neg_col] = False
+
+    df["Positive_effect_score"] = (
+        df["AF_positive_FDR"].astype(int) +
+        df["PAF_positive_FDR"].astype(int) +
+        df["RD_positive_FDR"].astype(int)
+    )
+
+    df["Negative_effect_score"] = (
+        df["AF_negative_FDR"].astype(int) +
+        df["PAF_negative_FDR"].astype(int) +
+        df["RD_negative_FDR"].astype(int)
+    )
+
+    df["Max_abs_effect_score"] = df[["Positive_effect_score", "Negative_effect_score"]].max(axis=1)
+
+    df["Effect_direction"] = np.where(
+        df["Positive_effect_score"] > df["Negative_effect_score"],
+        "positive",
+        np.where(
+            df["Negative_effect_score"] > df["Positive_effect_score"],
+            "negative",
+            "mixed_or_not_significant"
+        )
+    )
+
+    # 用 q 值排序。如果没有 q 值，则用 p 值。
+    sort_cols = ["Max_abs_effect_score"]
+
+    if "Bootstrap_AF_q_global" in df.columns:
+        df["min_q_AF_RD_PAF"] = df[[
+            "Bootstrap_AF_q_global",
+            "Bootstrap_PAF_q_global",
+            "Bootstrap_RD_q_global"
+        ]].min(axis=1)
+        sort_cols.append("min_q_AF_RD_PAF")
+    else:
+        df["min_p_AF_RD_PAF"] = df[[
+            "Bootstrap_AF_p_two_sided",
+            "Bootstrap_PAF_p_two_sided",
+            "Bootstrap_RD_p_two_sided"
+        ]].min(axis=1)
+        sort_cols.append("min_p_AF_RD_PAF")
+
+    df["Abs_Diff_AF"] = np.abs(df["Diff_Pooled_AF"])
+    df["Abs_Diff_RD"] = np.abs(df["Diff_Pooled_RD"])
+    df["Abs_Diff_PAF"] = np.abs(df["Diff_Pooled_PAF"])
+
+    df = df.sort_values(
+        by=sort_cols + ["Abs_Diff_AF", "Abs_Diff_RD", "Abs_Diff_PAF"],
+        ascending=[False, True, False, False, False]
+    )
+
+    selected_cols = [
+        "Mode", "Lag", "Lag_unit", "Comparison",
+        "Phase1", "Phase2",
+        "Effect_direction",
+        "Positive_effect_score",
+        "Negative_effect_score",
+        "Max_abs_effect_score",
+
+        "Diff_Pooled_AF",
+        "Bootstrap_AF_CI_low",
+        "Bootstrap_AF_CI_high",
+        "Bootstrap_AF_p_two_sided",
+        "Bootstrap_AF_q_global" if "Bootstrap_AF_q_global" in df.columns else None,
+
+        "Diff_Pooled_PAF",
+        "Bootstrap_PAF_CI_low",
+        "Bootstrap_PAF_CI_high",
+        "Bootstrap_PAF_p_two_sided",
+        "Bootstrap_PAF_q_global" if "Bootstrap_PAF_q_global" in df.columns else None,
+
+        "Diff_Pooled_RD",
+        "Bootstrap_RD_CI_low",
+        "Bootstrap_RD_CI_high",
+        "Bootstrap_RD_p_two_sided",
+        "Bootstrap_RD_q_global" if "Bootstrap_RD_q_global" in df.columns else None,
+
+        "Phase1_pooled_AF",
+        "Phase2_pooled_AF",
+        "Phase1_pooled_PAF",
+        "Phase2_pooled_PAF",
+        "Phase1_pooled_RD",
+        "Phase2_pooled_RD",
+        "Phase1_pooled_AR_fraction",
+        "Phase2_pooled_AR_fraction",
+        "Time_points_phase1",
+        "Time_points_phase2",
+        "Bootstrap_blocks_phase1",
+        "Bootstrap_blocks_phase2"
+    ]
+
+    selected_cols = [c for c in selected_cols if c is not None and c in df.columns]
+
+    return df[selected_cols].copy()
+
+
+def build_best_lag_by_comparison(ranking_df):
+    if ranking_df is None or len(ranking_df) == 0:
+        return pd.DataFrame()
+
+    df = ranking_df.copy()
+
+    # 每个 comparison 挑出分数最高、q/p 最小的 lag
+    if "Bootstrap_AF_q_global" in df.columns:
+        df["sort_q_or_p"] = df[[
+            "Bootstrap_AF_q_global",
+            "Bootstrap_PAF_q_global",
+            "Bootstrap_RD_q_global"
+        ]].min(axis=1)
+    else:
+        df["sort_q_or_p"] = df[[
+            "Bootstrap_AF_p_two_sided",
+            "Bootstrap_PAF_p_two_sided",
+            "Bootstrap_RD_p_two_sided"
+        ]].min(axis=1)
+
+    df = df.sort_values(
+        by=["Comparison", "Max_abs_effect_score", "sort_q_or_p", "Diff_Pooled_AF"],
+        ascending=[True, False, True, False]
+    )
+
+    best = df.groupby("Comparison", as_index=False).head(1).copy()
+    best = best.sort_values(
+        by=["Max_abs_effect_score", "sort_q_or_p"],
+        ascending=[False, True]
+    )
+
+    return best
+
+
+# ============================================================
+# 7. Report
+# ============================================================
+
+def write_lag_scan_report(summary_df, diff_df, ranking_df, best_df, output_file):
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("=== AR attribution lag-scan analysis ===\n\n")
+
+        f.write("Lag scan settings:\n")
+        for mode in CONTROL_MODES:
+            f.write(f"  {mode}: {LAG_SCAN[mode]} {MODE_LAG_UNIT[mode]}(s)\n")
+
+        f.write(f"\nMJO phase style: {MJO_PHASE_STYLE}\n")
+
+        f.write("\nBootstrap settings:\n")
+        f.write(f"  Bootstrap used: {RUN_BOOTSTRAP}\n")
+        f.write(f"  Bootstrap repetitions: {N_BOOT}\n")
+        f.write(f"  Bootstrap block: {BOOTSTRAP_BLOCK}\n")
+        f.write(f"  FDR correction available: {HAS_STATSMODELS}\n")
+
+        f.write("\n\n=== Top ranked lag effects ===\n")
+        if ranking_df is not None and len(ranking_df) > 0:
+            top_cols = [
+                "Mode", "Lag", "Lag_unit", "Comparison",
+                "Effect_direction",
+                "Positive_effect_score",
+                "Negative_effect_score",
+                "Max_abs_effect_score",
+                "Diff_Pooled_AF",
+                "Bootstrap_AF_CI_low",
+                "Bootstrap_AF_CI_high",
+                "Bootstrap_AF_p_two_sided",
+                "Bootstrap_AF_q_global" if "Bootstrap_AF_q_global" in ranking_df.columns else None,
+                "Diff_Pooled_PAF",
+                "Bootstrap_PAF_CI_low",
+                "Bootstrap_PAF_CI_high",
+                "Bootstrap_PAF_p_two_sided",
+                "Bootstrap_PAF_q_global" if "Bootstrap_PAF_q_global" in ranking_df.columns else None,
+                "Diff_Pooled_RD",
+                "Bootstrap_RD_CI_low",
+                "Bootstrap_RD_CI_high",
+                "Bootstrap_RD_p_two_sided",
+                "Bootstrap_RD_q_global" if "Bootstrap_RD_q_global" in ranking_df.columns else None
+            ]
+            top_cols = [c for c in top_cols if c is not None and c in ranking_df.columns]
+            f.write(ranking_df[top_cols].head(40).to_string(index=False))
+        else:
+            f.write("No ranking results.\n")
+
+        f.write("\n\n=== Best lag by comparison ===\n")
+        if best_df is not None and len(best_df) > 0:
+            best_cols = [
+                "Mode", "Lag", "Lag_unit", "Comparison",
+                "Effect_direction",
+                "Positive_effect_score",
+                "Negative_effect_score",
+                "Max_abs_effect_score",
+                "Diff_Pooled_AF",
+                "Bootstrap_AF_CI_low",
+                "Bootstrap_AF_CI_high",
+                "Diff_Pooled_PAF",
+                "Bootstrap_PAF_CI_low",
+                "Bootstrap_PAF_CI_high",
+                "Diff_Pooled_RD",
+                "Bootstrap_RD_CI_low",
+                "Bootstrap_RD_CI_high"
+            ]
+            best_cols = [c for c in best_cols if c in best_df.columns]
+            f.write(best_df[best_cols].to_string(index=False))
+        else:
+            f.write("No best-lag results.\n")
+
+        f.write("\n\n=== Interpretation note ===\n")
+        f.write(
+            "This lag-scan script is designed for screening robust mode-lag signals. "
+            "It uses regionally pooled counts and month-block bootstrap differences. "
+            "It does not perform gridwise Fisher tests for every lag, because that would be computationally expensive. "
+            "After identifying candidate mode-lag-phase combinations, rerun the gridwise version for spatial maps.\n\n"
+        )
+
+        f.write(
+            "Positive lag means that the climate-mode label is shifted forward in calendar time; "
+            "therefore an event at time t is associated with the mode state at t-lag.\n"
+        )
+
+
+# ============================================================
+# 8. Main
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("Loading NetCDF datasets...")
+
+    ar_ds = nc.Dataset(AR_FILE)
+    precip_ds = nc.Dataset(PRECIP_FILE)
+
+    ar_time = ar_ds.variables["time"][:]
+    ar_dates = num2date(
+        ar_time,
+        units=ar_ds.variables["time"].units,
+        calendar=ar_ds.variables["time"].calendar
+    )
+
+    precip_time = precip_ds.variables["time"][:]
+    precip_dates = num2date(
+        precip_time,
+        units=precip_ds.variables["time"].units,
+        calendar=precip_ds.variables["time"].calendar
+    )
+
+    if START_DATE_STR is None:
+        START_DATE_STR = input("起始日期（YYYY-MM-DD HH:MM:SS）: ")
+
+    if END_DATE_STR is None:
+        END_DATE_STR = input("结束日期（YYYY-MM-DD HH:MM:SS）: ")
+
+    start_date = datetime.strptime(START_DATE_STR, "%Y-%m-%d %H:%M:%S")
+    end_date = datetime.strptime(END_DATE_STR, "%Y-%m-%d %H:%M:%S")
+
+    print("Converting dates...")
+
+    ar_dates_pd = pd.to_datetime([
+        d.strftime("%Y-%m-%d %H:%M:%S") for d in tqdm(ar_dates, desc="AR dates")
+    ])
+
+    precip_dates_pd = pd.to_datetime([
+        d.strftime("%Y-%m-%d %H:%M:%S") for d in tqdm(precip_dates, desc="Precip dates")
+    ])
+
+    df_ar = pd.DataFrame(
+        {"ar_idx": np.arange(len(ar_dates_pd))},
+        index=ar_dates_pd
+    )
+
+    df_precip = pd.DataFrame(
+        {"precip_idx": np.arange(len(precip_dates_pd))},
+        index=precip_dates_pd
+    )
+
+    df_ar_sel = df_ar[start_date:end_date]
+    df_precip_sel = df_precip[start_date:end_date]
+
+    merged_df = df_ar_sel.merge(
+        df_precip_sel,
+        left_index=True,
+        right_index=True,
+        how="inner"
+    )
+
+    if merged_df.empty:
+        raise RuntimeError("指定时间范围内，AR 和 precipitation 文件没有共同时间点。")
+
+    ar_indices = merged_df["ar_idx"].values
+    precip_indices = merged_df["precip_idx"].values
+    selected_dates_pd = merged_df.index
+
+    if SEASONAL_MONTHS is not None:
+        month_mask = np.isin(selected_dates_pd.month, SEASONAL_MONTHS)
+        ar_indices = ar_indices[month_mask]
+        precip_indices = precip_indices[month_mask]
+        selected_dates_pd = selected_dates_pd[month_mask]
+
+        if len(selected_dates_pd) == 0:
+            raise RuntimeError(f"指定时间范围和季节 {SEASONAL_MONTHS} 内没有数据。")
+
+    print(f"Matched time steps: {len(selected_dates_pd)}")
+
+    print("Selecting spatial domain...")
+
+    precip_lats_all = precip_ds.variables["latitude"][:]
+    precip_lons_all = precip_ds.variables["longitude"][:]
+
+    ar_lats_all = ar_ds.variables["lat"][:]
+    ar_lons_all = ar_ds.variables["lon"][:]
+
+    precip_lat_indices = np.where(
+        (precip_lats_all >= LAT_MIN) & (precip_lats_all <= LAT_MAX)
+    )[0]
+    precip_lon_indices = np.where(
+        (precip_lons_all >= LON_MIN) & (precip_lons_all <= LON_MAX)
+    )[0]
+
+    ar_lat_indices = np.where(
+        (ar_lats_all >= LAT_MIN) & (ar_lats_all <= LAT_MAX)
+    )[0]
+    ar_lon_indices = np.where(
+        (ar_lons_all >= LON_MIN) & (ar_lons_all <= LON_MAX)
+    )[0]
+
+    precip_lats = precip_lats_all[precip_lat_indices]
+    precip_lons = precip_lons_all[precip_lon_indices]
+
+    ar_lats = ar_lats_all[ar_lat_indices]
+    ar_lons = ar_lons_all[ar_lon_indices]
+
+    if precip_lats.size > 1 and precip_lats[0] > precip_lats[-1]:
+        precip_lats = precip_lats[::-1]
+        precip_lat_indices = precip_lat_indices[::-1]
+
+    if ar_lats.size > 1 and ar_lats[0] > ar_lats[-1]:
+        ar_lats = ar_lats[::-1]
+        ar_lat_indices = ar_lat_indices[::-1]
+
+    print("Reading AR and precipitation arrays...")
+
+    ar_data = ar_ds.variables["ar_happen"][
+        ar_indices,
+        ar_lat_indices,
+        ar_lon_indices
+    ].astype(np.int8)
+
+    precip_data = precip_ds.variables["extreme_precipitation_flag"][
+        precip_indices,
+        precip_lat_indices,
+        precip_lon_indices
+    ].astype(np.int8)
+
+    if ar_data.shape != precip_data.shape:
+        raise RuntimeError(
+            f"AR and precipitation data shapes differ: "
+            f"AR={ar_data.shape}, Precip={precip_data.shape}. "
+            f"Please check grid consistency or regrid before analysis."
+        )
+
+    print("Precomputing time-wise regional counts...")
+
+    time_counts = precompute_time_counts(ar_data, precip_data)
+
+    print("Loading raw climate mode series...")
+
+    raw_mode_series = load_raw_mode_series()
+
+    print("\nRunning lag scan...")
+
+    summary_df, diff_df = run_lag_scan(
+        raw_mode_series=raw_mode_series,
+        dates_pd=selected_dates_pd,
+        time_counts=time_counts
+    )
+
+    print("\nBuilding effect ranking...")
+
+    ranking_df = build_effect_ranking(diff_df)
+    best_df = build_best_lag_by_comparison(ranking_df)
+
+    # ========================================================
+    # Save outputs
+    # ========================================================
+
+    summary_csv = os.path.join(OUTPUT_DIR, "lag_phase_summary_all.csv")
+    diff_csv = os.path.join(OUTPUT_DIR, "lag_pairwise_differences_all.csv")
+    ranking_csv = os.path.join(OUTPUT_DIR, "lag_effect_ranking.csv")
+    best_csv = os.path.join(OUTPUT_DIR, "best_lag_by_comparison.csv")
+    report_file = os.path.join(OUTPUT_DIR, "lag_scan_report.txt")
+    excel_file = os.path.join(OUTPUT_DIR, "mode_lag_scan_tables.xlsx")
+
+    summary_df.to_csv(summary_csv, index=False, encoding="utf-8-sig")
+    diff_df.to_csv(diff_csv, index=False, encoding="utf-8-sig")
+    ranking_df.to_csv(ranking_csv, index=False, encoding="utf-8-sig")
+    best_df.to_csv(best_csv, index=False, encoding="utf-8-sig")
+
+    print(f"Saved: {summary_csv}")
+    print(f"Saved: {diff_csv}")
+    print(f"Saved: {ranking_csv}")
+    print(f"Saved: {best_csv}")
+
+    try:
+        with pd.ExcelWriter(excel_file) as writer:
+            summary_df.to_excel(writer, sheet_name="phase_summary_all", index=False)
+            diff_df.to_excel(writer, sheet_name="pairwise_differences", index=False)
+            ranking_df.to_excel(writer, sheet_name="effect_ranking", index=False)
+            best_df.to_excel(writer, sheet_name="best_lag_by_comparison", index=False)
+        print(f"Saved: {excel_file}")
+    except Exception as e:
+        print(f"Excel output failed, but CSV files were saved. Reason: {e}")
+
+    write_lag_scan_report(
+        summary_df=summary_df,
+        diff_df=diff_df,
+        ranking_df=ranking_df,
+        best_df=best_df,
+        output_file=report_file
+    )
+
+    print(f"Saved: {report_file}")
+
+    ar_ds.close()
+    precip_ds.close()
+
+    print("\nAll lag-scan statistics completed.")
+    print("Output directory:", OUTPUT_DIR)
